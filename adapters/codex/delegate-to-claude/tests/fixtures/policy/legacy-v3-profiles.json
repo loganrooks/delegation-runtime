@@ -1,0 +1,62 @@
+{
+  "profile_version": 3,
+  "aliases": {
+    "readonly-review": "strict-readonly"
+  },
+  "profiles": {
+    "strict-readonly": {
+      "permission_mode": "dontAsk",
+      "tools": ["Read", "Grep", "Glob", "Skill"],
+      "requires_native_sandbox": false,
+      "uses_scratch_cwd": false,
+      "requires_artifact_output": false,
+      "requires_owned_paths": false,
+      "requires_auto_mode": false
+    },
+    "readonly-review": {
+      "permission_mode": "dontAsk",
+      "tools": ["Read", "Grep", "Glob", "Skill"],
+      "requires_native_sandbox": false,
+      "uses_scratch_cwd": false,
+      "requires_artifact_output": false,
+      "requires_owned_paths": false,
+      "requires_auto_mode": false
+    },
+    "verified-review": {
+      "permission_mode": "dontAsk",
+      "tools": ["Read", "Grep", "Glob", "Skill", "Bash"],
+      "requires_native_sandbox": true,
+      "uses_scratch_cwd": true,
+      "requires_artifact_output": false,
+      "requires_owned_paths": false,
+      "requires_auto_mode": false
+    },
+    "artifact-review": {
+      "permission_mode": "dontAsk",
+      "tools": ["Read", "Grep", "Glob", "Skill", "Bash"],
+      "requires_native_sandbox": true,
+      "uses_scratch_cwd": true,
+      "requires_artifact_output": true,
+      "requires_owned_paths": false,
+      "requires_auto_mode": false
+    },
+    "implementation": {
+      "permission_mode": "acceptEdits",
+      "tools": ["Read", "Grep", "Glob", "Skill", "Bash", "Write", "Edit"],
+      "requires_native_sandbox": true,
+      "uses_scratch_cwd": false,
+      "requires_artifact_output": false,
+      "requires_owned_paths": true,
+      "requires_auto_mode": false
+    },
+    "implementation-auto": {
+      "permission_mode": "auto",
+      "tools": ["Read", "Grep", "Glob", "Skill", "Bash", "Write", "Edit"],
+      "requires_native_sandbox": true,
+      "uses_scratch_cwd": false,
+      "requires_artifact_output": false,
+      "requires_owned_paths": true,
+      "requires_auto_mode": true
+    }
+  }
+}

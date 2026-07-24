@@ -1,0 +1,23 @@
+name: checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: delegate-to-claude tests
+        run: |
+          PYTHONPATH=adapters/codex/delegate-to-claude/scripts:adapters/codex/scripts python3 -m unittest discover -s adapters/codex/delegate-to-claude/tests -p 'test_*.py' -v
+      - name: delegate-to-antigravity tests
+        run: |
+          PYTHONPATH=adapters/codex/delegate-to-antigravity/scripts:adapters/codex/scripts python3 -m unittest discover -s adapters/codex/delegate-to-antigravity/tests -p 'test_*.py' -v
+      - name: delegation_policy tests
+        run: |
+          PYTHONPATH=adapters/codex/scripts python3 -m unittest discover -s adapters/codex/tests -p 'test_*.py' -v
