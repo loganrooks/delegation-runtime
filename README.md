@@ -29,21 +29,23 @@ worktree under `adapters/codex/`, where it remained **untracked** (in no commit)
 excluded) and first committed in this repository. Design lineage: the cross-runtime routing
 proposal and the composable policy proposal, both in delegation-triage `docs/proposals/`.
 
-**Layout note:** the `adapters/codex/` prefix is vestigial — preserved so the move commit is
-byte-identical and the test suites (which compute the repo root as `parents[4]` of the test
-file and hardcode `adapters/codex/...` entrypoint paths, e.g.
-`delegate-to-antigravity/tests/test_agy_delegate.py:15`) pass unmodified. Flattening the
-layout and fixing the root computation is this repo's first registered refactor.
+**Layout note:** the `adapters/codex/` prefix was vestigial — preserved through the move so the
+move commit could be byte-identical and the test suites (which computed the repo root as
+`parents[4]` of the test file and hardcoded `adapters/codex/...` entrypoint paths) passed
+unmodified. That prefix was **flattened on 2026-07-24** — this repo's first registered refactor:
+the four trees (`delegate-to-claude/`, `delegate-to-antigravity/`, `scripts/`, `tests/`) now sit
+at the repository root, `adapters/` is gone, and the dependent root computation, entrypoint
+path, CI `PYTHONPATH`s and discovery roots, and the commands below were updated in the same pass.
 
 ## Running the tests
 
 ```bash
-PYTHONPATH=adapters/codex/delegate-to-claude/scripts:adapters/codex/scripts \
-  python3 -m unittest discover -s adapters/codex/delegate-to-claude/tests -p 'test_*.py'
-PYTHONPATH=adapters/codex/delegate-to-antigravity/scripts:adapters/codex/scripts \
-  python3 -m unittest discover -s adapters/codex/delegate-to-antigravity/tests -p 'test_*.py'
-PYTHONPATH=adapters/codex/scripts \
-  python3 -m unittest discover -s adapters/codex/tests -p 'test_*.py'
+PYTHONPATH=delegate-to-claude/scripts:scripts \
+  python3 -m unittest discover -s delegate-to-claude/tests -p 'test_*.py'
+PYTHONPATH=delegate-to-antigravity/scripts:scripts \
+  python3 -m unittest discover -s delegate-to-antigravity/tests -p 'test_*.py'
+PYTHONPATH=scripts \
+  python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 CI (`.github/workflows/ci.yml`) runs all three; the delegate-to-claude step is the one that

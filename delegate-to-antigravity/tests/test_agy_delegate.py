@@ -12,8 +12,8 @@ import textwrap
 import unittest
 
 
-ROOT = Path(__file__).resolve().parents[4]
-ENTRYPOINT = ROOT / "adapters/codex/delegate-to-antigravity/scripts/agy_delegate.py"
+ROOT = Path(__file__).resolve().parents[2]
+ENTRYPOINT = ROOT / "delegate-to-antigravity/scripts/agy_delegate.py"
 
 
 FAKE_AGY = """\

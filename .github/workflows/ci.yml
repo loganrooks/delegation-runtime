@@ -14,10 +14,10 @@ jobs:
           python-version: "3.12"
       - name: delegate-to-claude tests
         run: |
-          PYTHONPATH=adapters/codex/delegate-to-claude/scripts:adapters/codex/scripts python3 -m unittest discover -s adapters/codex/delegate-to-claude/tests -p 'test_*.py' -v
+          PYTHONPATH=delegate-to-claude/scripts:scripts python3 -m unittest discover -s delegate-to-claude/tests -p 'test_*.py' -v
       - name: delegate-to-antigravity tests
         run: |
-          PYTHONPATH=adapters/codex/delegate-to-antigravity/scripts:adapters/codex/scripts python3 -m unittest discover -s adapters/codex/delegate-to-antigravity/tests -p 'test_*.py' -v
+          PYTHONPATH=delegate-to-antigravity/scripts:scripts python3 -m unittest discover -s delegate-to-antigravity/tests -p 'test_*.py' -v
       - name: delegation_policy tests
         run: |
-          PYTHONPATH=adapters/codex/scripts python3 -m unittest discover -s adapters/codex/tests -p 'test_*.py' -v
+          PYTHONPATH=scripts python3 -m unittest discover -s tests -p 'test_*.py' -v
