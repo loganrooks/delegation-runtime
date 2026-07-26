@@ -49,10 +49,28 @@ IDENTITY_SOURCES = frozenset({"transcript", "api", "ui-label"})
 TOOL_PROFILES = frozenset({"ro", "rw"})
 VENDORS = ("anthropic", "openai", "google", "other")
 FREE_SLOT = "other"
+HUMAN_ROUTER = "human"
 # Crosswalk §2/§3: the closed vocabularies are unpublished, so `other` + an
 # origin-local free slot is the only honest member today.
 REGISTERED_REASON_CODES: frozenset[str] = frozenset()
 REGISTERED_VALIDATOR_OUTCOMES: frozenset[str] = frozenset()
+REGISTERED_VALIDATION_ORACLES: frozenset[str] = frozenset()
+REGISTERED_CLOSURE_TARGETS: frozenset[str] = frozenset()
+REGISTERED_FRICTION_CODES: frozenset[str] = frozenset()
+REGISTERED_CONFOUNDER_CODES: frozenset[str] = frozenset()
+# Crosswalk §5.3 [v0.2.1]: native writers apply the free-code rule at WRITE
+# time, so a native store is exportable-by-construction. Scalar free-code
+# fields take `reason_code`'s treatment verbatim; the two list fields take it
+# per element, with an index-aligned `*_free` sibling list.
+FREE_CODE_SCALARS = {
+    "reason_code": "REGISTERED_REASON_CODES",
+    "validation_oracle": "REGISTERED_VALIDATION_ORACLES",
+    "closure_target": "REGISTERED_CLOSURE_TARGETS",
+}
+FREE_CODE_LISTS = {
+    "friction_codes": "REGISTERED_FRICTION_CODES",
+    "confounder_codes": "REGISTERED_CONFOUNDER_CODES",
+}
 SEED_MODEL_ALIASES = {
     "terra": "openai:gpt-5.6-terra",
     "gpt-5.6-terra": "openai:gpt-5.6-terra",
@@ -102,12 +120,15 @@ INTENT_FIELDS = COMMON | {
     "router_model",
     "reason_code",
     "reason_code_free",
+    "note_hash",
     "price_lineage",
     "reversibility",
     "consequence",
     "ambiguity",
     "validation_oracle",
+    "validation_oracle_free",
     "closure_target",
+    "closure_target_free",
     "write_scope_count",
 }
 OUTCOME_FIELDS = COMMON | {
@@ -123,7 +144,9 @@ OUTCOME_FIELDS = COMMON | {
     "rework_count",
     "validator",
     "friction_codes",
+    "friction_codes_free",
     "confounder_codes",
+    "confounder_codes_free",
 }
 # Crosswalk §1 enumerates the rekey field set exactly; it carries no run_id,
 # attestation, or projection.
@@ -289,6 +312,11 @@ def _check_object(value: object, field: str, required=(), optional=()) -> dict:
     return value
 
 
+def _registry(name: str) -> frozenset[str]:
+    """Resolved at call time so a registry can be patched in once one exists."""
+    return globals()[name]
+
+
 def _check_registered(value: object, field: str, registered) -> None:
     if not isinstance(value, str) or (value != FREE_SLOT and value not in registered):
         raise RecordError(
@@ -296,11 +324,43 @@ def _check_registered(value: object, field: str, registered) -> None:
         )
 
 
-def _check_code_list(value: object, field: str, *, limit: int = 16) -> None:
+def _check_code_list(value: object, field: str, registry: str, *, limit: int = 16) -> None:
+    """Every element is a registered member or `other` — never raw free code."""
     if not isinstance(value, list) or len(value) > limit or len(set(map(repr, value))) != len(value):
         raise RecordError(f"{field} must be a unique list of at most {limit} codes")
-    for item in value:
-        _check_code(item, field)
+    registered = _registry(registry)
+    for index, item in enumerate(value):
+        _check_registered(item, f"{field}[{index}]", registered)
+
+
+def _check_free_list(record: dict[str, object], field: str) -> None:
+    """`<field>_free` is index-aligned with `<field>`: text where the base
+    element is `other`, null everywhere else. Same gate as the scalar rule, one
+    position at a time."""
+    free_field = f"{field}_free"
+    if free_field not in record:
+        return
+    codes = record.get(field)
+    if not isinstance(codes, list):
+        raise RecordError(f"{free_field} requires {field} to be present")
+    free = record[free_field]
+    if not isinstance(free, list) or len(free) != len(codes):
+        raise RecordError(f"{free_field} must be a list the same length as {field}")
+    for index, (code, text) in enumerate(zip(codes, free)):
+        if code == FREE_SLOT:
+            _check_text(text, f"{free_field}[{index}]", maxlen=256)
+        elif text is not None:
+            raise RecordError(
+                f"{free_field}[{index}] is allowed only where {field}[{index}] is {FREE_SLOT!r}"
+            )
+
+
+def _check_free_scalar(record: dict[str, object], field: str) -> None:
+    free_field = f"{field}_free"
+    if free_field in record and record.get(field) != FREE_SLOT:
+        raise RecordError(
+            f"{free_field} is allowed only when {field} is {FREE_SLOT!r}"
+        )
 
 
 def _check_warrant_ids(value: object) -> None:
@@ -319,6 +379,9 @@ def _check_task_class(value: object) -> None:
         )
 
 
+# Crosswalk §2 [v0.2.1]: exactly these three, extension by amendment only. An
+# open map would smuggle operator-chosen keys and values past a name-level
+# export check (R1 F-6).
 HARNESS_CORE_FEATURES = ("review_gate", "claim_tagging", "tool_profile")
 
 
@@ -326,31 +389,31 @@ def _check_harness_contract(value: object) -> None:
     contract = _check_object(value, "harness_contract", ("sha256", "label", "features"))
     _check_pattern(contract["sha256"], "harness_contract.sha256", SHA256_RE, "64 hex characters")
     _check_text(contract["label"], "harness_contract.label", maxlen=80)
-    features = contract["features"]
-    if not isinstance(features, dict):
-        raise RecordError("harness_contract.features must be an object")
-    missing = set(HARNESS_CORE_FEATURES) - set(features)
-    if missing:
-        raise RecordError(f"harness_contract.features: missing fields: {sorted(missing)}")
+    features = _check_object(
+        contract["features"], "harness_contract.features", HARNESS_CORE_FEATURES
+    )
     _check_bool(features["review_gate"], "harness_contract.features.review_gate")
     _check_bool(features["claim_tagging"], "harness_contract.features.claim_tagging")
     _check_enum(
         features["tool_profile"], "harness_contract.features.tool_profile", TOOL_PROFILES
     )
-    for name, item in features.items():
-        if name in HARNESS_CORE_FEATURES:
-            continue
-        _check_code(name, "harness_contract.features key")
-        if type(item) is bool:
-            continue
-        if not isinstance(item, str) or len(item) > 32 or not CODE_RE.fullmatch(item):
-            raise RecordError(
-                f"harness_contract.features.{name} must be a bool or a short enum string"
-            )
 
 
 def _check_binding(value: object, field: str) -> None:
     _check_pattern(value, field, BINDING_RE, "a normalized vendor:model binding")
+
+
+def _check_router_model(value: object) -> None:
+    # Crosswalk §2 [v0.2.1]: the field's own semantics name a human router, so
+    # the literal is legal — `other:human` was a workaround (R1 F-12).
+    if value == HUMAN_ROUTER:
+        return
+    _check_pattern(
+        value,
+        "router_model",
+        BINDING_RE,
+        f"a normalized vendor:model binding or the literal {HUMAN_ROUTER!r}",
+    )
 
 
 def _check_requested_model(value: object) -> None:
@@ -365,14 +428,22 @@ def _check_requested_model(value: object) -> None:
     _check_text(model["raw"], "requested_model.raw", maxlen=128)
 
 
+# Crosswalk §3 [v0.2.1]: a null `observed_model` is legal only where nothing
+# could have been observed. On any other disposition it is the un-joinable
+# record E-1 is blocked on (R1 F-3).
+UNOBSERVABLE_DISPOSITIONS = frozenset({"error", "blocked", "interrupted", "abandoned"})
+
+
 def _check_observed_model(value: object) -> None:
-    # REQ per crosswalk §3, nullable for the run where nothing was observed
-    # (error / blocked before any model answered) — see README.
     if value is None:
         return
-    model = _check_object(value, "observed_model", ("id", "identity_source"))
+    model = _check_object(
+        value, "observed_model", ("id", "identity_source"), ("raw",)
+    )
     _check_binding(model["id"], "observed_model.id")
     _check_enum(model["identity_source"], "observed_model.identity_source", IDENTITY_SOURCES)
+    if "raw" in model:
+        _check_text(model["raw"], "observed_model.raw", maxlen=128)
 
 
 def _check_tokens(value: object) -> None:
@@ -438,17 +509,28 @@ FIELD_CHECKS = {
     "warrant_ids": _check_warrant_ids,
     "rung": lambda value: _check_code(value, "rung"),
     "router_effort": lambda value: _check_enum(value, "router_effort", EFFORTS),
-    "router_model": lambda value: _check_binding(value, "router_model"),
+    "router_model": _check_router_model,
     "reason_code": lambda value: _check_registered(
-        value, "reason_code", REGISTERED_REASON_CODES
+        value, "reason_code", _registry("REGISTERED_REASON_CODES")
     ),
     "reason_code_free": lambda value: _check_text(value, "reason_code_free", maxlen=256),
+    "note_hash": lambda value: _check_pattern(
+        value, "note_hash", SHA256_RE, "a sha256 hex digest of the origin-local note"
+    ),
     "price_lineage": _check_price_lineage,
     "reversibility": lambda value: _check_code(value, "reversibility"),
     "consequence": lambda value: _check_code(value, "consequence"),
     "ambiguity": lambda value: _check_code(value, "ambiguity"),
-    "validation_oracle": lambda value: _check_code(value, "validation_oracle"),
-    "closure_target": lambda value: _check_code(value, "closure_target"),
+    "validation_oracle": lambda value: _check_registered(
+        value, "validation_oracle", _registry("REGISTERED_VALIDATION_ORACLES")
+    ),
+    "validation_oracle_free": lambda value: _check_text(
+        value, "validation_oracle_free", maxlen=256
+    ),
+    "closure_target": lambda value: _check_registered(
+        value, "closure_target", _registry("REGISTERED_CLOSURE_TARGETS")
+    ),
+    "closure_target_free": lambda value: _check_text(value, "closure_target_free", maxlen=256),
     "write_scope_count": lambda value: _check_int(value, "write_scope_count"),
     "outcome_ordinal": lambda value: _check_int(value, "outcome_ordinal"),
     "terminal": lambda value: _check_bool(value, "terminal"),
@@ -461,11 +543,47 @@ FIELD_CHECKS = {
     "rework_actor": lambda value: _check_enum(value, "rework_actor", REWORK_ACTORS),
     "rework_count": lambda value: _check_int(value, "rework_count"),
     "validator": _check_validator,
-    "friction_codes": lambda value: _check_code_list(value, "friction_codes"),
-    "confounder_codes": lambda value: _check_code_list(value, "confounder_codes"),
+    "friction_codes": lambda value: _check_code_list(
+        value, "friction_codes", "REGISTERED_FRICTION_CODES"
+    ),
+    "friction_codes_free": lambda value: None,  # checked against its base list
+    "confounder_codes": lambda value: _check_code_list(
+        value, "confounder_codes", "REGISTERED_CONFOUNDER_CODES"
+    ),
+    "confounder_codes_free": lambda value: None,  # checked against its base list
     "mappings": _check_mappings,
     "sig": lambda value: _check_pattern(value, "sig", SIG_RE, "a bounded signature string"),
 }
+
+
+# Crosswalk §3a [v0.2.1]: the S3 mapping table BINDS native records wherever a
+# row fixes `terminal` / `rework_actor` for a disposition. Four dispositions are
+# fixed by a single row each. `accepted-after-rework` is deliberately absent —
+# three §3a rows map onto it with disagreeing values (revise: false/unknown;
+# accept-after-revision: true/delegate; accept-with-root-revision: true/root),
+# so the table fixes nothing for it. `blocked`/`error`/`abandoned`/
+# `completed-unknown` appear in no §3a row at all.
+DISPOSITION_PAIRINGS = {
+    "accepted": {"terminal": True, "rework_actor": "none"},
+    "parked": {"terminal": False, "rework_actor": "none"},
+    "rejected": {"terminal": True, "rework_actor": "none"},
+    "interrupted": {"terminal": True, "rework_actor": "none"},
+}
+
+
+def _check_outcome_cross_field(raw: dict[str, object]) -> None:
+    disposition = raw.get("disposition")
+    if raw.get("observed_model") is None and disposition not in UNOBSERVABLE_DISPOSITIONS:
+        raise RecordError(
+            f"observed_model may be null only when disposition is one of "
+            f"{sorted(UNOBSERVABLE_DISPOSITIONS)}, not {disposition!r}"
+        )
+    for field, expected in DISPOSITION_PAIRINGS.get(disposition, {}).items():
+        if field in raw and raw[field] != expected:
+            raise RecordError(
+                f"crosswalk §3a fixes {field}={expected!r} for disposition "
+                f"{disposition!r}, got {raw[field]!r}"
+            )
 
 
 def validate_record(raw: object) -> dict[str, object]:
@@ -483,10 +601,12 @@ def validate_record(raw: object) -> dict[str, object]:
         raise RecordError(f"missing required fields: {sorted(missing)}")
     for field, value in raw.items():
         FIELD_CHECKS[field](value)
-    if "reason_code_free" in raw and raw.get("reason_code") != FREE_SLOT:
-        raise RecordError(
-            f"reason_code_free is allowed only when reason_code is {FREE_SLOT!r}"
-        )
+    for field in FREE_CODE_SCALARS:
+        _check_free_scalar(raw, field)
+    for field in FREE_CODE_LISTS:
+        _check_free_list(raw, field)
+    if kind == "outcome":
+        _check_outcome_cross_field(raw)
     return dict(raw)
 
 
@@ -554,13 +674,27 @@ class store_lock:
     def __init__(self, home: Path, timeout: float = LOCK_TIMEOUT_SECONDS) -> None:
         self.path = home / LOCK_NAME
         self.timeout = timeout
+        # Identifies THIS holder. Reclaiming a stale sentinel means some other
+        # writer may hold the lock by the time we finish, so releasing has to
+        # check that the sentinel is still ours (R1 F-8).
+        self.token = f"{os.getpid()}:{os.urandom(8).hex()}"
 
     def _claim(self) -> bool:
         try:
-            os.close(os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
             return False
+        try:
+            os.write(fd, self.token.encode("utf-8"))
+        finally:
+            os.close(fd)
         return True
+
+    def _holds(self) -> bool:
+        try:
+            return self.path.read_text(encoding="utf-8") == self.token
+        except (FileNotFoundError, UnicodeDecodeError):
+            return False
 
     def _age_seconds(self) -> float:
         try:
@@ -586,7 +720,10 @@ class store_lock:
         return self
 
     def __exit__(self, *exc_info: object) -> bool:
-        self.path.unlink(missing_ok=True)
+        # Never unlink a sentinel another writer now owns — that would hand a
+        # third writer a lock two others believe they hold.
+        if self._holds():
+            self.path.unlink(missing_ok=True)
         return False
 
 
@@ -614,6 +751,7 @@ def read_records(paths) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     seen: set[object] = set()
     terminals: set[object] = set()
+    join_keys: set[tuple[object, object]] = set()
     for path, number, item in scan_records(paths):
         try:
             record = validate_record(item)
@@ -622,23 +760,31 @@ def read_records(paths) -> list[dict[str, object]]:
         if record["event_id"] in seen:
             raise RecordError(f"{path.name} line {number}: duplicate event_id")
         seen.add(record["event_id"])
-        if record["kind"] == "outcome" and record["terminal"] is True:
-            if record["run_id"] in terminals:
+        if record["kind"] == "outcome":
+            join_key = (record["run_id"], record["outcome_ordinal"])
+            if join_key in join_keys:
                 raise RecordError(
-                    f"{path.name} line {number}: second terminal outcome for run_id"
+                    f"{path.name} line {number}: duplicate (run_id, outcome_ordinal)"
                 )
-            terminals.add(record["run_id"])
+            join_keys.add(join_key)
+            if record["terminal"] is True:
+                if record["run_id"] in terminals:
+                    raise RecordError(
+                        f"{path.name} line {number}: second terminal outcome for run_id"
+                    )
+                terminals.add(record["run_id"])
         records.append(record)
     return records
 
 
 def _next_spawn_ordinal(home: Path, record: dict[str, object]) -> int:
-    path = store_path(home, str(record["ts"]))
-    if not path.exists():
-        return 0
+    """Counted over the WHOLE store, not the current month: a session running
+    across a month boundary otherwise restarts at 0 and silently collides with
+    its own earlier spawns (R1 F-4). The duplicate-id scan already pays this cost.
+    """
     session = record.get("session_id")
     count = 0
-    for _, _, item in scan_records([path]):
+    for _, _, item in scan_records(store_files(home)):
         if item.get("kind") == "intent" and item.get("session_id") == session:
             count += 1
     return count
@@ -671,6 +817,12 @@ def _resolve_outcome(home: Path, record: dict[str, object], *, allow_orphan: boo
         record["orphan"] = True
     if "outcome_ordinal" not in record:
         record["outcome_ordinal"] = max(ordinals) + 1 if ordinals else 0
+    elif record["outcome_ordinal"] in ordinals:
+        # (run_id, outcome_ordinal) is the §3 join key — a silent collision fans
+        # the join out (R1 F-5).
+        raise RecordError(
+            f"run_id {run_id!r} already carries outcome_ordinal {record['outcome_ordinal']!r}"
+        )
     if record.get("terminal") is True and terminals:
         raise RecordError(f"run_id {run_id!r} already carries a terminal outcome")
 
@@ -696,14 +848,25 @@ def _prepare(
 
 
 def _append(path: Path, record: dict[str, object]) -> None:
-    """One line, one `os.write`, then fsync — no buffering layer to flush wrong."""
-    line = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
-    payload = line.encode("utf-8")
+    """One line, one `os.write`, then fsync — no buffering layer to flush wrong.
+
+    A short write would leave a half-line that fails every later read of the
+    store, so the pre-write size is captured and restored before raising. The
+    caller holds the lock, so nothing else can have appended in between and the
+    truncation can only discard our own partial bytes (R1 F-7).
+    """
+    payload = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    size = path.stat().st_size if path.exists() else 0
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
         written = os.write(fd, payload)
         if written != len(payload):
-            raise RecordError(f"short append to {path.name}: {written}/{len(payload)} bytes")
+            os.ftruncate(fd, size)
+            os.fsync(fd)
+            raise RecordError(
+                f"short append to {path.name} ({written}/{len(payload)} bytes); "
+                f"rolled back to {size} bytes"
+            )
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -870,7 +1033,14 @@ def _outcome_from_flags(args: argparse.Namespace, aliases: dict[str, str]) -> di
         observed = {
             "id": normalize_model(args.observed_model, aliases),
             "identity_source": args.observed_identity_source,
+            "raw": args.observed_model,
         }
+    elif args.disposition not in UNOBSERVABLE_DISPOSITIONS:
+        # Never let the default path write a null observation silently (R1 F-3).
+        raise RecordError(
+            f"--observed-model is required for disposition {args.disposition!r}; "
+            f"it may be omitted only for {sorted(UNOBSERVABLE_DISPOSITIONS)}"
+        )
     record: dict[str, object] = {
         "kind": "outcome",
         "run_id": args.run_id,

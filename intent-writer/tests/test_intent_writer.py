@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -16,6 +17,7 @@ import intent_writer
 from intent_writer import (
     ATTESTATION,
     CODE_RE,
+    DISPOSITION_PAIRINGS,
     DISPOSITIONS,
     EFFORTS,
     IDENTITY_SOURCES,
@@ -24,6 +26,7 @@ from intent_writer import (
     REWORK_ACTORS,
     SURFACES,
     TOOL_PROFILES,
+    UNOBSERVABLE_DISPOSITIONS,
     V,
     RecordError,
     load_aliases,
@@ -172,8 +175,14 @@ class EnumTests(unittest.TestCase):
 
     def test_every_disposition_member_is_accepted(self):
         for value in sorted(DISPOSITIONS):
+            # §3a fixes `terminal` for four of them; supply what the table binds.
+            fixed = DISPOSITION_PAIRINGS.get(value, {})
             with self.subTest(disposition=value):
-                validate_record(complete(outcome(disposition=value)))
+                validate_record(
+                    complete(
+                        outcome(disposition=value, terminal=fixed.get("terminal", True))
+                    )
+                )
 
     def test_disposition_outside_the_enum_is_rejected(self):
         # v0's six-member enum matched 0/96 live S3 values; these are its ghosts.
@@ -182,14 +191,21 @@ class EnumTests(unittest.TestCase):
                 validate_record(complete(outcome(disposition=bad)))
 
     def test_every_rework_actor_member_is_accepted(self):
+        # `accepted-after-rework` is the one disposition §3a leaves free on both
+        # axes (three rows map onto it with disagreeing values), so it is where
+        # the rework_actor enum can be exercised in full.
         for value in sorted(REWORK_ACTORS):
             with self.subTest(actor=value):
-                validate_record(complete(outcome(rework_actor=value)))
+                validate_record(
+                    complete(outcome(disposition="accepted-after-rework", rework_actor=value))
+                )
 
     def test_rework_actor_outside_the_enum_is_rejected(self):
         for bad in ("parent", "child", "", True):
             with self.subTest(bad=bad), self.assertRaisesRegex(RecordError, "rework_actor"):
-                validate_record(complete(outcome(rework_actor=bad)))
+                validate_record(
+                    complete(outcome(disposition="accepted-after-rework", rework_actor=bad))
+                )
 
     def test_every_identity_source_member_is_accepted(self):
         for value in sorted(IDENTITY_SOURCES):
@@ -835,7 +851,18 @@ class CliTests(StoreTestCase):
         self.assertIsNone(self.lines()[1]["observed_model"])
 
     def test_orphan_outcome_is_refused_until_allow_orphan_is_passed(self):
-        argv = ("record-outcome", "--run-id", "ghost", "--disposition", "accepted", "--terminal")
+        argv = (
+            "record-outcome",
+            "--run-id",
+            "ghost",
+            "--disposition",
+            "accepted",
+            "--terminal",
+            "--observed-model",
+            "anthropic:claude-opus-5",
+            "--observed-identity-source",
+            "transcript",
+        )
         code, _, err = self.run_cli(*argv)
         self.assertEqual(code, 1)
         self.assertIn("--allow-orphan", err)
@@ -869,6 +896,412 @@ class CliTests(StoreTestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["record_count"], 0)
+
+
+class FreeCodeRuleTests(unittest.TestCase):
+    """R1 F-1: the `reason_code` treatment extended to every free-code field,
+    applied at write time so a native store is exportable-by-construction."""
+
+    def test_scalar_free_code_fields_reject_raw_operational_strings(self):
+        # The exact values the R1 probe smuggled through: a repo-relative test
+        # path and a merge-state sentence.
+        for field, value in (
+            ("validation_oracle", "tests/test_gate2_slice_a.py::test_budget"),
+            ("closure_target", "PR-441-merged-and-green"),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(RecordError, field):
+                validate_record(complete(intent(**{field: value})))
+
+    def test_scalar_free_code_fields_accept_the_free_slot_pair(self):
+        for field in ("validation_oracle", "closure_target"):
+            with self.subTest(field=field):
+                validate_record(
+                    complete(intent(**{field: "other", f"{field}_free": "tests/test_x.py"}))
+                )
+
+    def test_scalar_free_slot_requires_the_base_field_to_be_other(self):
+        for field in ("validation_oracle", "closure_target"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(RecordError, f"{field}_free"):
+                    validate_record(complete(intent(**{f"{field}_free": "anything"})))
+
+    def test_a_registered_scalar_member_is_accepted_once_a_vocabulary_exists(self):
+        with unittest.mock.patch.object(
+            intent_writer, "REGISTERED_VALIDATION_ORACLES", frozenset({"unit-tests"})
+        ):
+            validate_record(complete(intent(validation_oracle="unit-tests")))
+            with self.assertRaisesRegex(RecordError, "validation_oracle_free"):
+                validate_record(
+                    complete(intent(validation_oracle="unit-tests", validation_oracle_free="x"))
+                )
+
+    def test_list_free_code_fields_reject_raw_elements(self):
+        for field, value in (
+            ("friction_codes", "reviewer-disagreed-on-scope-in-round-2"),
+            ("confounder_codes", "ran/under/gateway@cliproxy:8317"),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(RecordError, field):
+                validate_record(complete(outcome(**{field: [value]})))
+
+    def test_list_free_code_fields_accept_other_with_an_aligned_free_list(self):
+        validate_record(
+            complete(
+                outcome(
+                    friction_codes=["other"],
+                    friction_codes_free=["reviewer disagreed on scope in round 2"],
+                )
+            )
+        )
+
+    def test_a_free_list_must_match_its_base_list_length(self):
+        for free in ([], ["a", "b"]):
+            with self.subTest(free=free):
+                with self.assertRaisesRegex(RecordError, "same length"):
+                    validate_record(
+                        complete(outcome(friction_codes=["other"], friction_codes_free=free))
+                    )
+
+    def test_a_free_list_without_its_base_list_is_rejected(self):
+        with self.assertRaisesRegex(RecordError, "requires friction_codes"):
+            validate_record(complete(outcome(friction_codes_free=["x"])))
+
+    def test_a_free_slot_is_null_where_the_element_is_not_other(self):
+        with unittest.mock.patch.object(
+            intent_writer, "REGISTERED_FRICTION_CODES", frozenset({"rate-limit"})
+        ):
+            validate_record(
+                complete(
+                    outcome(
+                        friction_codes=["rate-limit", "other"],
+                        friction_codes_free=[None, "something local"],
+                    )
+                )
+            )
+            with self.assertRaisesRegex(RecordError, r"friction_codes_free\[0\]"):
+                validate_record(
+                    complete(
+                        outcome(
+                            friction_codes=["rate-limit", "other"],
+                            friction_codes_free=["leaked", "something local"],
+                        )
+                    )
+                )
+
+    def test_the_write_path_applies_the_rule_not_just_validate(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        home = Path(temp.name) / "v2"
+        with self.assertRaisesRegex(RecordError, "validation_oracle"):
+            write_record(home, intent(validation_oracle="tests/test_budget.py::test_x"))
+        self.assertEqual(store_files(home), [])
+
+
+class ObservedModelGateTests(StoreTestCase):
+    """R1 F-3 / F-10."""
+
+    def test_null_is_legal_only_on_the_four_unobservable_dispositions(self):
+        self.assertEqual(
+            sorted(UNOBSERVABLE_DISPOSITIONS), ["abandoned", "blocked", "error", "interrupted"]
+        )
+        for value in sorted(UNOBSERVABLE_DISPOSITIONS):
+            fixed = DISPOSITION_PAIRINGS.get(value, {})
+            with self.subTest(disposition=value):
+                validate_record(
+                    complete(
+                        outcome(
+                            disposition=value,
+                            terminal=fixed.get("terminal", True),
+                            observed_model=None,
+                        )
+                    )
+                )
+
+    def test_null_is_rejected_on_every_other_disposition(self):
+        for value in sorted(DISPOSITIONS - UNOBSERVABLE_DISPOSITIONS):
+            fixed = DISPOSITION_PAIRINGS.get(value, {})
+            with self.subTest(disposition=value):
+                with self.assertRaisesRegex(RecordError, "observed_model may be null"):
+                    validate_record(
+                        complete(
+                            outcome(
+                                disposition=value,
+                                terminal=fixed.get("terminal", True),
+                                observed_model=None,
+                            )
+                        )
+                    )
+
+    def test_the_bare_flag_path_errors_instead_of_writing_null(self):
+        self.run_cli(*CliTests.INTENT_ARGV, "--requested-model", "terra")
+        code, _, err = self.run_cli(
+            "record-outcome", "--run-id", "run-1", "--disposition", "accepted", "--terminal"
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("--observed-model is required", err)
+        self.assertEqual(len(self.lines()), 1)
+
+    def test_the_flag_path_still_allows_omission_on_an_unobservable_disposition(self):
+        self.run_cli(*CliTests.INTENT_ARGV, "--requested-model", "terra")
+        code, _, _ = self.run_cli(
+            "record-outcome", "--run-id", "run-1", "--disposition", "blocked", "--terminal"
+        )
+        self.assertEqual(code, 0)
+        self.assertIsNone(self.lines()[1]["observed_model"])
+
+    def test_observed_model_accepts_an_optional_raw_spelling(self):
+        validate_record(
+            complete(
+                outcome(
+                    observed_model={
+                        "id": "openai:gpt-5.6-terra",
+                        "identity_source": "transcript",
+                        "raw": "terra",
+                    }
+                )
+            )
+        )
+
+    def test_observed_model_raw_must_be_bounded_text(self):
+        with self.assertRaisesRegex(RecordError, "observed_model.raw"):
+            validate_record(
+                complete(
+                    outcome(
+                        observed_model={
+                            "id": "openai:gpt-5.6-terra",
+                            "identity_source": "transcript",
+                            "raw": "x" * 129,
+                        }
+                    )
+                )
+            )
+
+    def test_the_flag_path_preserves_the_typed_spelling_as_raw(self):
+        self.run_cli(*CliTests.INTENT_ARGV, "--requested-model", "terra")
+        self.run_cli(
+            "record-outcome", "--run-id", "run-1", "--disposition", "accepted", "--terminal",
+            "--observed-model", "gpt-5-6-terra", "--observed-identity-source", "transcript",
+        )
+        observed = self.lines()[1]["observed_model"]
+        self.assertEqual(observed["id"], "openai:gpt-5.6-terra")
+        self.assertEqual(observed["raw"], "gpt-5-6-terra")
+
+
+class DispositionPairingTests(unittest.TestCase):
+    """R1 F-11: crosswalk §3a binds native records."""
+
+    def test_the_bound_dispositions_are_exactly_the_single_row_ones(self):
+        self.assertEqual(
+            sorted(DISPOSITION_PAIRINGS), ["accepted", "interrupted", "parked", "rejected"]
+        )
+
+    def test_each_bound_disposition_accepts_its_fixed_pair(self):
+        for value, fixed in DISPOSITION_PAIRINGS.items():
+            with self.subTest(disposition=value):
+                validate_record(
+                    complete(
+                        outcome(
+                            disposition=value,
+                            terminal=fixed["terminal"],
+                            rework_actor=fixed["rework_actor"],
+                            observed_model=None
+                            if value in UNOBSERVABLE_DISPOSITIONS
+                            else {"id": "anthropic:claude-opus-5", "identity_source": "api"},
+                        )
+                    )
+                )
+
+    def test_a_contradicting_terminal_flag_is_rejected(self):
+        for value, fixed in DISPOSITION_PAIRINGS.items():
+            with self.subTest(disposition=value):
+                with self.assertRaisesRegex(RecordError, "§3a fixes terminal"):
+                    validate_record(
+                        complete(
+                            outcome(
+                                disposition=value,
+                                terminal=not fixed["terminal"],
+                                observed_model=None
+                                if value in UNOBSERVABLE_DISPOSITIONS
+                                else {"id": "anthropic:claude-opus-5", "identity_source": "api"},
+                            )
+                        )
+                    )
+
+    def test_a_contradicting_rework_actor_is_rejected(self):
+        with self.assertRaisesRegex(RecordError, "§3a fixes rework_actor"):
+            validate_record(complete(outcome(disposition="accepted", rework_actor="delegate")))
+
+    def test_accepted_after_rework_is_left_free_on_both_axes(self):
+        # Three §3a rows map onto it with disagreeing values, so it fixes nothing.
+        for terminal, actor in ((False, "unknown"), (True, "delegate"), (True, "root")):
+            with self.subTest(terminal=terminal, actor=actor):
+                validate_record(
+                    complete(
+                        outcome(
+                            disposition="accepted-after-rework",
+                            terminal=terminal,
+                            rework_actor=actor,
+                        )
+                    )
+                )
+
+    def test_dispositions_absent_from_the_table_are_unconstrained(self):
+        for value in ("blocked", "error", "abandoned", "completed-unknown"):
+            for terminal in (True, False):
+                with self.subTest(disposition=value, terminal=terminal):
+                    validate_record(
+                        complete(
+                            outcome(
+                                disposition=value,
+                                terminal=terminal,
+                                rework_actor="delegate",
+                                # `completed-unknown` is outside the §3a table
+                                # but also outside the null carve-out.
+                                observed_model=None
+                                if value in UNOBSERVABLE_DISPOSITIONS
+                                else {
+                                    "id": "anthropic:claude-opus-5",
+                                    "identity_source": "transcript",
+                                },
+                            )
+                        )
+                    )
+
+
+class ClosedShapeTests(unittest.TestCase):
+    """R1 F-6, F-9, F-12."""
+
+    def test_harness_features_reject_any_key_outside_the_three(self):
+        contract = {
+            "sha256": SHA,
+            "label": "x",
+            "features": {
+                "review_gate": True,
+                "claim_tagging": True,
+                "tool_profile": "ro",
+                "client_codename": "projectX",
+            },
+        }
+        with self.assertRaisesRegex(RecordError, "client_codename"):
+            validate_record(complete(intent(harness_contract=contract)))
+
+    def test_harness_features_accept_exactly_the_three(self):
+        validate_record(complete(intent()))
+
+    def test_note_hash_accepts_a_sha256_digest(self):
+        validate_record(complete(intent(reason_code="other", note_hash="a" * 64)))
+
+    def test_note_hash_rejects_anything_that_is_not_a_digest(self):
+        for bad in ("nope", "A" * 64, "a" * 63, 12345):
+            with self.subTest(bad=bad), self.assertRaisesRegex(RecordError, "note_hash"):
+                validate_record(complete(intent(note_hash=bad)))
+
+    def test_router_model_accepts_the_human_literal(self):
+        validate_record(complete(intent(router_model="human")))
+
+    def test_router_model_still_requires_a_binding_otherwise(self):
+        for bad in ("Human", "a person", "claude-opus-5"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(RecordError, "router_model"):
+                validate_record(complete(intent(router_model=bad)))
+
+
+class JoinKeyTests(StoreTestCase):
+    """R1 F-5."""
+
+    def test_an_explicit_duplicate_join_key_is_refused_at_write(self):
+        write_record(self.home, intent())
+        write_record(self.home, outcome(terminal=False, disposition="parked", outcome_ordinal=0))
+        with self.assertRaisesRegex(RecordError, "already carries outcome_ordinal"):
+            write_record(self.home, outcome(terminal=True, outcome_ordinal=0))
+        self.assertEqual(len(self.lines()), 2)
+
+    def test_the_same_ordinal_under_a_different_run_is_fine(self):
+        write_record(self.home, intent(run_id="run-1"))
+        write_record(self.home, intent(run_id="run-2"))
+        write_record(self.home, outcome(run_id="run-1", outcome_ordinal=0))
+        write_record(self.home, outcome(run_id="run-2", outcome_ordinal=0))
+        self.assertEqual(len(self.lines()), 4)
+
+    def test_validate_catches_a_duplicate_join_key_written_around_the_writer(self):
+        write_record(self.home, intent())
+        write_record(self.home, outcome(terminal=False, disposition="parked", outcome_ordinal=0))
+        path = store_files(self.home)[0]
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(complete(outcome(terminal=False, disposition="parked"), outcome_ordinal=0))
+                + "\n"
+            )
+        code, _, err = self.run_cli("validate")
+        self.assertEqual(code, 1)
+        self.assertIn("duplicate (run_id, outcome_ordinal)", err)
+
+
+class SpawnOrdinalAcrossMonthsTests(StoreTestCase):
+    """R1 F-4."""
+
+    def test_the_counter_does_not_restart_at_a_month_boundary(self):
+        first = write_record(self.home, intent(run_id="r1", ts="2026-06-30T23:59:59Z"))
+        second = write_record(self.home, intent(run_id="r2", ts="2026-07-01T00:00:01Z"))
+        third = write_record(self.home, intent(run_id="r3", ts="2026-07-01T00:00:02Z"))
+        self.assertEqual(
+            [first["spawn_ordinal"], second["spawn_ordinal"], third["spawn_ordinal"]], [0, 1, 2]
+        )
+        self.assertEqual(len(store_files(self.home)), 2)
+
+    def test_sessions_stay_independent_across_month_files(self):
+        write_record(self.home, intent(run_id="a1", session_id="a", ts="2026-06-30T23:00:00Z"))
+        other = write_record(
+            self.home, intent(run_id="b1", session_id="b", ts="2026-07-01T01:00:00Z")
+        )
+        self.assertEqual(other["spawn_ordinal"], 0)
+
+
+class DurableWriteTests(StoreTestCase):
+    """R1 F-7, F-8."""
+
+    def test_a_short_append_is_rolled_back_and_the_store_stays_readable(self):
+        write_record(self.home, intent())
+        path = store_files(self.home)[0]
+        before = path.stat().st_size
+        real_write = os.write
+
+        def short_write(fd, data):
+            # Only truncate record lines; the lock sentinel must write in full.
+            if data.endswith(b"\n"):
+                return real_write(fd, data[: len(data) // 2])
+            return real_write(fd, data)
+
+        with unittest.mock.patch.object(intent_writer.os, "write", short_write):
+            with self.assertRaisesRegex(RecordError, "short append"):
+                write_record(self.home, intent(run_id="short"))
+        self.assertEqual(path.stat().st_size, before)
+        self.assertEqual(len(read_records(store_files(self.home))), 1)
+
+    def test_a_writer_does_not_release_a_sentinel_it_no_longer_owns(self):
+        self.home.mkdir(parents=True)
+        first = store_lock(self.home)
+        first.__enter__()
+        os.utime(self.home / LOCK_NAME, (0, 0))
+        second = store_lock(self.home, timeout=0.5)
+        second.__enter__()
+        try:
+            first.__exit__()
+            self.assertTrue((self.home / LOCK_NAME).exists())
+            with self.assertRaisesRegex(RecordError, "lock"):
+                store_lock(self.home, timeout=0.05).__enter__()
+        finally:
+            second.__exit__()
+        self.assertFalse((self.home / LOCK_NAME).exists())
+
+    def test_the_sentinel_carries_a_pid_and_nonce(self):
+        self.home.mkdir(parents=True)
+        with store_lock(self.home) as lock:
+            token = lock.path.read_text(encoding="utf-8")
+        pid, _, nonce = token.partition(":")
+        self.assertEqual(int(pid), os.getpid())
+        self.assertEqual(len(nonce), 16)
+
+    def test_two_locks_in_the_same_process_get_distinct_tokens(self):
+        self.assertNotEqual(store_lock(self.home).token, store_lock(self.home).token)
 
 
 if __name__ == "__main__":

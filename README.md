@@ -6,8 +6,8 @@ delegate-to-claude (Claude sessions) and delegate-to-antigravity (Gemini Flash v
 Antigravity bridge), sharing a `delegation_policy` schema/diff/explain core. `intent-writer/`
 is the driver-side v2 record writer (B-7) that emits the routing evidence those runs produce.
 
-**Status: pre-validation.** 395 passing tests (223 claude + 10 antigravity + 74 policy +
-88 intent-writer), **zero completed real worker turns**. The first milestone is one attested end-to-end worker
+**Status: pre-validation.** 433 passing tests (223 claude + 10 antigravity + 74 policy +
+126 intent-writer), **zero completed real worker turns**. The first milestone is one attested end-to-end worker
 turn (registered in delegation-triage's 2026-07-24 portfolio review as item C-3, parked
 pending operator-authorized spend). Until then, nothing here is a validated route.
 

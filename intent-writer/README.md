@@ -6,10 +6,12 @@ writer" the crosswalk names — the only source that can supply `route_id`, `war
 `surface`, and `harness_contract`, which are `∅` in all three existing capture systems (the
 Claude Code OTel stream, the spawn ledger, and Codex orchestration-learning v1).
 
-**Authority:** the ratified crosswalk v0.2 —
-delegation-triage `docs/proposals/2026-07-24-intent-outcome-record-crosswalk.md` (RATIFIED
-2026-07-24, D-B3-1/D-B3-2). Local build contract: [`SPEC.md`](SPEC.md). **Where the two
-disagree the crosswalk governs**; the deviations that follow from that rule are listed below.
+**Authority:** the ratified crosswalk, now **v0.2.1** (amended 2026-07-26 after this module's
+R1 conformance review) — delegation-triage
+`docs/proposals/2026-07-24-intent-outcome-record-crosswalk.md`. Local build contract:
+[`SPEC.md`](SPEC.md). **Where the two disagree the crosswalk governs.** SPEC.md predates
+v0.2.1, so on `observed_model`, `harness_contract.features`, the free-code rule, `orphan`,
+`note_hash`, `router_model`, and the §3a pairings, read the crosswalk.
 
 This is not a projector. It writes native v2 records only (`projection: native`,
 `attestation: driver-attested`); projecting S1/S2/S3 history into v2 is a separate item.
@@ -58,26 +60,50 @@ Model ids normalize to `vendor:model`. The alias table seeds from the crosswalk'
 `<home>/model-aliases.json` — a data file, not a code edit. An unrecognized alias is **rejected,
 never guessed**.
 
-## Deviations from SPEC.md (crosswalk governs)
+## The rules that bite most often
 
-- **`observed_model` is REQUIRED on outcomes.** Crosswalk §3 marks it REQ; SPEC.md listed it
-  optional. The key must be stated — but the value may be `null`, because a run that errored
-  before any model answered has nothing to observe, and silence and "nothing ran" must not look
-  alike.
-- **`requested_model` may be `null`.** Crosswalk §2 records the session-inherited spawn as
-  `requested_model: null` (330/724 measured S2 spawn requests). SPEC.md required an object.
-  Recording generic spawns is the point of a driver-side writer, so the CLI says it out loud
-  with `--session-inherited-model` rather than by omission.
+- **Free-code fields never take raw operational strings.** `reason_code`, `validation_oracle`,
+  `closure_target` and every element of `friction_codes` / `confounder_codes` must be a
+  registered vocabulary member or the literal `other`; the origin-local text goes in a
+  `*_free` sibling that is legal *only* where the base is `other`. For the two list fields the
+  sibling is an index-aligned list — text at positions where the element is `other`, `null`
+  everywhere else. No vocabulary is registered yet, so in practice everything is
+  `other` + free today. This is applied at **write** time (crosswalk §5.3), so a native store
+  is exportable-by-construction rather than needing a scrub later.
+- **`observed_model` is REQUIRED on outcomes, and null is gated.** A null value is legal only
+  when `disposition` is `error`, `blocked`, `interrupted`, or `abandoned` — nothing answered, so
+  nothing was observable. On any other disposition the CLI refuses rather than writing a
+  silently un-joinable record. Optional `raw` preserves the spelling you typed.
+- **Crosswalk §3a binds native records.** `accepted` and `rejected` and `interrupted` are
+  terminal with `rework_actor: none`; `parked` is non-terminal with `rework_actor: none`.
+  `accepted-after-rework` is free on both axes (three §3a rows map onto it with disagreeing
+  values), as are `blocked` / `error` / `abandoned` / `completed-unknown`, which appear in no
+  §3a row.
+- **`harness_contract.features` is exactly three keys** — `review_gate`, `claim_tagging`,
+  `tool_profile`. Extension is by crosswalk amendment, not by writing a new key: an open map
+  would smuggle operator-chosen keys past a name-level export check.
+- **`requested_model` may be `null`** for a session-inherited (generic) spawn — said out loud
+  with `--session-inherited-model`, never by omission. **`router_model`** takes a normalized
+  binding or the literal `human`. **`note_hash`** (optional, intents) is a sha256 hex digest of
+  an origin-local note; the note itself never enters the record.
+- **`orphan` is writer-stamped, never caller-asserted**, and is origin-local/non-exportable.
 
 ## Limits worth knowing
 
-- `task_class.class` must stay `null`. The closed enum is unpublished (crosswalk §2a), so any
-  value would be unvalidatable; `class_free` carries the native term meanwhile.
-- `reason_code` and `validator.outcome` accept only `other` today — no vocabulary is registered
-  yet. The free-text slot is origin-local and non-exportable.
-- `spawn_ordinal` is derived by scanning the current month file, so a session spanning a month
-  boundary restarts its count.
-- Every write scans the store for duplicate ids: correctness over speed, per spec, at current
-  volumes.
+- **`validate --file` checks cross-record invariants only within that file.** Duplicate
+  `event_id`, duplicate `(run_id, outcome_ordinal)`, and the one-terminal-per-run rule are
+  enforced across the lines it reads — so a collision whose two halves sit in different month
+  files is caught by a bare `validate` (whole home) and missed by `validate --file`. Prefer the
+  whole-home form for conformance checks.
+- A **pre-existing** malformed line blocks further writes, because every write scans the store
+  for duplicate ids. The writer will not create one — a short append is rolled back to the
+  pre-write size inside the lock — but damage from outside the writer needs manual repair.
+- `task_class.class` must stay `null` until the closed enum is published (crosswalk §2a, made
+  explicit in v0.2.1): there is no vocabulary to validate against, so the writer fails closed
+  and `class_free` carries the native term meanwhile.
+- No vocabulary is registered for any free-code field yet, so `other` + a `*_free` slot is the
+  only honest form today. Those slots are origin-local and non-exportable.
+- `spawn_ordinal` and the duplicate-id check both scan the whole store, not just the current
+  month: correctness over speed at current volumes.
 - No projectors, no export path, no HMAC pseudonymization, no daemon. Records are local and
   carry native values; export-time concerns are §5's, not this module's.
