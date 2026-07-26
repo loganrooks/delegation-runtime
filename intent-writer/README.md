@@ -41,10 +41,27 @@ only the required ones. Each subcommand takes `--home DIR`; otherwise `DELEGATIO
 ## Store
 
 Append-only JSONL at `<home>/intents-YYYY-MM.jsonl`, one sorted-key compact record per line,
-mode 0600 under a 0700 directory. Writes take an advisory lock file, append with
-`O_APPEND|O_CREAT`, and fsync. **Nothing here ever touches a v1 store** — a single v2 line
+mode 0600 under a 0700 directory. **Nothing here ever touches a v1 store** — a single v2 line
 appended to Codex's `events.jsonl` bricks that reader's `audit`, `summarize`, and all
 subsequent writes (crosswalk §6.0-b).
+
+Writes serialize on an `fcntl.flock` over `<home>/.intents.lock`, then append with
+`O_APPEND|O_CREAT|O_NOFOLLOW` and fsync. The kernel owns the lock, so it is released both on
+close and on process death — there is no lease to expire and no stale-lock reclaim, because a
+reclaim protocol is inherently racy (two writers can observe the same stale lock and both take
+it). The lock file itself is never unlinked: removing it would let a later writer lock a
+different inode while a holder still has the old one.
+
+Every write takes the lock, scans the store **once** to build the index it needs (duplicate ids,
+both ordinal sequences, every uniqueness invariant), then appends. That is still O(store) work
+per write, so building N records is O(N²) parsing overall — fine at the volumes this sees
+(tens to thousands), and deliberately not optimized yet. A durable index is the fix when it
+matters; the trigger to do it is write latency becoming noticeable, not a record count.
+
+The store is opened `O_NOFOLLOW` and confirmed a regular file before any byte is written or
+read, and its mode is forced to 0600 on every append — a store file planted as a symlink would
+otherwise redirect the append outside the home, and one left at an inherited 0644 would stay
+world-readable.
 
 ## Validation is fail-closed
 
@@ -94,6 +111,20 @@ was requested, it does not adjudicate what is servable.
   binding or the literal `human`. **`note_hash`** (optional, intents) is a sha256 hex digest of
   an origin-local note; the note itself never enters the record.
 - **`orphan` is writer-stamped, never caller-asserted**, and is origin-local/non-exportable.
+- **Every join and invariant is keyed by `(origin, run_id)`**, with an omitted `origin` read as
+  `local` (crosswalk §1). `run_id` is unique *within* an origin, so two origins may each carry a
+  run named `r`, each with its own ordinals and its own terminal outcome. The canonicalization is
+  for keying only — an omitted origin stays omitted on disk, because §1 says it may be.
+- **One intent per `(origin, run_id)`**, and one intent per
+  `(origin, session_id, spawn_ordinal)`. A second intent for a run is either a re-spawn that
+  needs its own `run_id` or a double-write; both are refused. **Intents with no `session_id`
+  share a single per-origin bucket keyed `None`** — "unsessioned" counts as one session for
+  ordinal derivation, and the uniqueness rule applies to it unchanged.
+- **Numbers must be finite.** `NaN` and `Infinity` serialize as bare `NaN`/`Infinity`, which is
+  not JSON — one such line makes a strict reader reject the whole store.
+- **Display-bearing text rejects lone surrogates and bidi format controls.** A lone surrogate
+  survives `json.dumps` but is not encodable UTF-8; a bidi override makes a label render as
+  something other than what was recorded. Ordinary non-ASCII text is unaffected.
 - **The first three friction codes are registered** (crosswalk v0.2.2): `fabricated-completion`,
   `silent-scope-violation`, `undetected-omission` — severe-failure classes, accepted bare
   alongside `other`+free. The crosswalk pairs them with a "requires ≥ `third-party-verified`
@@ -115,13 +146,25 @@ was requested, it does not adjudicate what is servable.
   whole-home form for conformance checks.
 - A **pre-existing** malformed line blocks further writes, because every write scans the store
   for duplicate ids. The writer will not create one — a short append is rolled back to the
-  pre-write size inside the lock — but damage from outside the writer needs manual repair.
+  pre-write size inside the lock — but damage from outside the writer needs manual repair. The
+  same applies to a store whose last line is missing its newline: reads and writes both refuse
+  it, rather than letting the next append glue two records onto one line.
+- **`fsync` can fail after the bytes are already in the file.** That is reported as an
+  `UNKNOWN COMMIT` error carrying the `event_id`, with CLI exit code **3** (distinct from the
+  ordinary failure code 1, precisely so a wrapper does not retry it blindly). The line may or
+  may not be durable and the writer cannot tell; inspect the store, and if you retry, reuse the
+  returned `event_id` rather than minting a new one.
+- **`event_id` ordering is monotonic within a process, not across processes.** Same-millisecond
+  ids from one writer increase, and a backwards clock is clamped rather than emitting a
+  decreasing id — but two concurrent writers can issue same-millisecond ids that sort
+  arbitrarily against each other. Order the store by `ts` and append position, not by
+  `event_id`.
 - `task_class.class` must stay `null` until the closed enum is published (crosswalk §2a, made
   explicit in v0.2.1): there is no vocabulary to validate against, so the writer fails closed
   and `class_free` carries the native term meanwhile.
 - No vocabulary is registered for any free-code field yet, so `other` + a `*_free` slot is the
   only honest form today. Those slots are origin-local and non-exportable.
-- `spawn_ordinal` and the duplicate-id check both scan the whole store, not just the current
-  month: correctness over speed at current volumes.
+- Ordinal derivation and the duplicate-id check scan the whole store, not just the current
+  month, and share a single pass: correctness over speed at current volumes (see Store).
 - No projectors, no export path, no HMAC pseudonymization, no daemon. Records are local and
   carry native values; export-time concerns are §5's, not this module's.

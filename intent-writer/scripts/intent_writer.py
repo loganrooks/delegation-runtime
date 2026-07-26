@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
+import stat
 import sys
+import threading
 import time
 
 
@@ -96,7 +100,10 @@ STORE_PREFIX = "intents-"
 LOCK_NAME = ".intents.lock"
 LOCK_TIMEOUT_SECONDS = 5.0
 LOCK_POLL_SECONDS = 0.02
-STALE_LOCK_SECONDS = 30.0
+DEFAULT_ORIGIN = "local"
+EXIT_UNKNOWN_COMMIT = 3
+# Crosswalk §1: "local records may omit (implied `local`)". Records are left as
+# the caller wrote them — the canonicalization is for KEYING only (SC-4).
 
 CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/@-]{0,127}$")
 BINDING_RE = re.compile(rf"^({'|'.join(VENDORS)}):[A-Za-z0-9][A-Za-z0-9._+-]{{0,63}}$")
@@ -107,6 +114,9 @@ TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SIG_RE = re.compile(r"^[A-Za-z0-9+/=_-]{1,512}$")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+# LRE/RLE/PDF/LRO/RLO, LRI/RLI/FSI/PDI, LRM/RLM, ALM.
+BIDI_RE = re.compile(r"[‪-‮⁦-⁩‎‏؜]")
 
 CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
@@ -215,6 +225,19 @@ class RecordError(ValueError):
     """A fail-closed rejection of a record, a store line, or a CLI invocation."""
 
 
+class UnknownCommitError(RecordError):
+    """The line may or may not be durable — the writer cannot tell (SC-10).
+
+    Carries the `event_id` so a retry can reuse it instead of minting a second
+    semantic record under a new id. Raised only after the bytes reached the file
+    but `fsync` failed.
+    """
+
+    def __init__(self, message: str, event_id: str) -> None:
+        super().__init__(message)
+        self.event_id = event_id
+
+
 def _b32(value: int, length: int) -> str:
     chars = []
     for _ in range(length):
@@ -223,17 +246,54 @@ def _b32(value: int, length: int) -> str:
     return "".join(reversed(chars))
 
 
+ULID_MAX_MS = (1 << 48) - 1
+ULID_MAX_ENTROPY = (1 << 80) - 1
+_ULID_GUARD = threading.Lock()
+_ULID_LAST: tuple[int, int] | None = None
+
+
 def ulid(now_ms: int | None = None) -> str:
-    """Crockford base32 ULID: 48-bit millisecond prefix + 80 random bits."""
-    stamp = int(time.time() * 1000) if now_ms is None else now_ms
-    if not 0 <= stamp < (1 << 48):
-        raise RecordError("ulid timestamp out of range")
-    return _b32(stamp, 10) + _b32(int.from_bytes(os.urandom(10), "big"), 16)
+    """Crockford base32 ULID: 48-bit millisecond prefix + 80 random bits.
+
+    Monotonic WITHIN THIS PROCESS (SC-7): same-millisecond calls increment the
+    entropy rather than re-randomizing, and a wall-clock regression is clamped
+    to the last issued millisecond, so ids issued in order sort in order.
+
+    **This guarantee does not cross processes.** Two concurrent writers can
+    issue same-millisecond ids that sort against each other arbitrarily; the
+    store's ordering authority is `ts` plus append order, not `event_id`.
+    """
+    global _ULID_LAST
+    with _ULID_GUARD:
+        stamp = int(time.time() * 1000) if now_ms is None else now_ms
+        if not 0 <= stamp <= ULID_MAX_MS:
+            raise RecordError("ulid timestamp out of range")
+        if _ULID_LAST is not None:
+            last_stamp, last_entropy = _ULID_LAST
+            if stamp <= last_stamp:
+                # Same ms, or the clock went backwards: keep issuing forward.
+                if last_entropy < ULID_MAX_ENTROPY:
+                    stamp, entropy = last_stamp, last_entropy + 1
+                elif last_stamp < ULID_MAX_MS:
+                    stamp, entropy = last_stamp + 1, 0
+                else:
+                    raise RecordError("ulid space exhausted for this millisecond")
+                _ULID_LAST = (stamp, entropy)
+                return _b32(stamp, 10) + _b32(entropy, 16)
+        entropy = int.from_bytes(os.urandom(10), "big")
+        _ULID_LAST = (stamp, entropy)
+        return _b32(stamp, 10) + _b32(entropy, 16)
 
 
 def ulid_time_ms(value: str) -> int:
     if not ULID_RE.fullmatch(value):
         raise RecordError("event_id must be a 26-character Crockford base32 ULID")
+    if value[0] > "7":
+        # 26 Crockford chars carry 130 bits; a canonical ULID is 128. A leading
+        # char above '7' overflows the 48-bit time prefix (SC-7).
+        raise RecordError(
+            "event_id is an overflow-form ULID: the first character must be 0-7"
+        )
     stamp = 0
     for char in value[:10]:
         stamp = stamp * 32 + CROCKFORD.index(char)
@@ -279,12 +339,21 @@ def _check_code(value: object, field: str) -> None:
 
 
 def _check_text(value: object, field: str, *, maxlen: int) -> None:
+    """Display-bearing text: bounded, and safe to hand to a downstream reader."""
     if not isinstance(value, str) or not value.strip():
         raise RecordError(f"{field} must be a nonempty string")
     if len(value) > maxlen:
         raise RecordError(f"{field} exceeds {maxlen} characters")
     if CONTROL_RE.search(value):
         raise RecordError(f"{field} must not contain control characters")
+    # A lone surrogate survives `json.dumps` (ensure_ascii escapes it) but is
+    # not encodable UTF-8, so it breaks any strict consumer (SC-9).
+    if SURROGATE_RE.search(value):
+        raise RecordError(f"{field} must not contain surrogate code points")
+    # Bidi overrides visually reorder the value wherever it is displayed, so a
+    # label can render as something other than what was recorded (SC-9).
+    if BIDI_RE.search(value):
+        raise RecordError(f"{field} must not contain bidirectional format controls")
 
 
 def _check_bool(value: object, field: str) -> None:
@@ -298,13 +367,29 @@ def _check_int(value: object, field: str, *, minimum: int = 0) -> None:
 
 
 def _check_number(value: object, field: str, *, minimum: float = 0.0) -> None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RecordError(f"{field} must be a number >= {minimum}")
+    # NaN/Infinity serialize as bare `NaN`/`Infinity`, which is not JSON — a
+    # strict reader rejects the whole store (SC-2). NaN also fails every
+    # comparison, so the range check below would silently pass it.
+    if not math.isfinite(value):
+        raise RecordError(f"{field} must be a finite number, not {value!r}")
+    if value < minimum:
         raise RecordError(f"{field} must be a number >= {minimum}")
 
 
 def _check_pattern(value: object, field: str, pattern: re.Pattern[str], hint: str) -> None:
     if not isinstance(value, str) or not pattern.fullmatch(value):
         raise RecordError(f"{field} must be {hint}")
+
+
+def _check_date(value: object, field: str) -> None:
+    """Shape AND calendar: `2026-99-99` matches the regex but is not a date (SC-9)."""
+    _check_pattern(value, field, DATE_RE, "an ISO date (YYYY-MM-DD)")
+    try:
+        date.fromisoformat(str(value))
+    except ValueError as exc:
+        raise RecordError(f"{field} is not a real calendar date") from exc
 
 
 def _check_ts(value: object, field: str = "ts") -> None:
@@ -490,7 +575,7 @@ def _check_price_lineage(value: object) -> None:
     _check_binding(price["binding"], "price_lineage.binding")
     _check_number(price["price_per_mtok_in"], "price_lineage.price_per_mtok_in")
     _check_number(price["price_per_mtok_out"], "price_lineage.price_per_mtok_out")
-    _check_pattern(price["as_of"], "price_lineage.as_of", DATE_RE, "an ISO date (YYYY-MM-DD)")
+    _check_date(price["as_of"], "price_lineage.as_of")
 
 
 def _check_mappings(value: object) -> None:
@@ -505,9 +590,7 @@ def _check_mappings(value: object) -> None:
 FIELD_CHECKS = {
     "v": lambda value: _check_literal(value, "v", V),
     "kind": lambda value: _check_enum(value, "kind", KINDS),
-    "event_id": lambda value: _check_pattern(
-        value, "event_id", ULID_RE, "a 26-character Crockford base32 ULID"
-    ),
+    "event_id": lambda value: ulid_time_ms(value),
     "ts": _check_ts,
     "origin": lambda value: _check_code(value, "origin"),
     "run_id": lambda value: _check_code(value, "run_id"),
@@ -677,78 +760,103 @@ def _normalize_bindings(record: dict[str, object], aliases: dict[str, str]) -> N
 
 
 class store_lock:
-    """Advisory whole-store lock: an `O_EXCL` sentinel file beside the store.
+    """Advisory whole-store lock: `fcntl.flock` on a lock file beside the store.
 
-    The store is a single append-only file per month, so one writer at a time is
-    the whole requirement — the sentinel is claimed for the duration of a write
-    and released in `__exit__`. A sentinel older than `STALE_LOCK_SECONDS` is
-    treated as abandoned, because a writer killed mid-write must not wedge every
-    later spawn; that window is far longer than any honest write takes.
+    The kernel owns the lock, so it is released on close AND on process death —
+    which is what retires the whole stale-reclaim problem (SC-1). The previous
+    sentinel protocol tried to emulate that with a mtime lease plus a pid+nonce
+    token, and could not: two writers observing the same stale sentinel could
+    both unlink and both claim, and `_holds()`/`unlink()` was itself a TOCTOU
+    pair. No lease, no reclaim, no token, and therefore none of those races.
+
+    The lock file is never unlinked — unlinking it would let a later writer
+    create a *different* inode and lock that instead, while an existing holder
+    still has the old one.
     """
 
     def __init__(self, home: Path, timeout: float = LOCK_TIMEOUT_SECONDS) -> None:
         self.path = home / LOCK_NAME
         self.timeout = timeout
-        # Identifies THIS holder. Reclaiming a stale sentinel means some other
-        # writer may hold the lock by the time we finish, so releasing has to
-        # check that the sentinel is still ours (R1 F-8).
-        self.token = f"{os.getpid()}:{os.urandom(8).hex()}"
-
-    def _claim(self) -> bool:
-        try:
-            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            return False
-        try:
-            os.write(fd, self.token.encode("utf-8"))
-        finally:
-            os.close(fd)
-        return True
-
-    def _holds(self) -> bool:
-        try:
-            return self.path.read_text(encoding="utf-8") == self.token
-        except (FileNotFoundError, UnicodeDecodeError):
-            return False
-
-    def _age_seconds(self) -> float:
-        try:
-            return time.time() - self.path.stat().st_mtime
-        except FileNotFoundError:
-            # Released between our failed claim and this check — retry at once.
-            return float("inf")
+        self.fd: int | None = None
 
     def __enter__(self) -> store_lock:
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         deadline = time.monotonic() + self.timeout
         waited = 0
-        while not self._claim():
-            if self._age_seconds() > STALE_LOCK_SECONDS:
-                self.path.unlink(missing_ok=True)
-                continue
-            if time.monotonic() >= deadline:
-                raise RecordError(
-                    f"record store lock held by another writer: gave up after "
-                    f"{self.timeout:g}s ({waited} retries)"
-                )
-            waited += 1
-            time.sleep(LOCK_POLL_SECONDS)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    raise RecordError(
+                        f"record store lock held by another writer: gave up after "
+                        f"{self.timeout:g}s ({waited} retries)"
+                    ) from None
+                waited += 1
+                time.sleep(LOCK_POLL_SECONDS)
+        self.fd = fd
         return self
 
     def __exit__(self, *exc_info: object) -> bool:
-        # Never unlink a sentinel another writer now owns — that would hand a
-        # third writer a lock two others believe they hold.
-        if self._holds():
-            self.path.unlink(missing_ok=True)
+        if self.fd is not None:
+            # Closing releases the flock; unlocking first keeps that explicit.
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd)
+                self.fd = None
         return False
+
+
+def origin_of(record: dict[str, object]) -> object:
+    """Crosswalk §1: an omitted `origin` means `local`.
+
+    Canonicalized for KEYING only — the record is left exactly as written, so
+    "may omit" stays true on disk (SC-4).
+    """
+    origin = record.get("origin")
+    return DEFAULT_ORIGIN if origin is None else origin
+
+
+def _read_store_text(path: Path) -> str:
+    """Read a store file without following a symlink into it (SC-8)."""
+    try:
+        # O_NONBLOCK so a FIFO planted in the store's place fails fast instead of
+        # blocking the reader forever waiting for a writer; it is a no-op on a
+        # regular file, which is the only thing we go on to accept (SC-8).
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        raise RecordError(f"{path} does not exist") from None
+    except OSError as exc:
+        raise RecordError(f"{path.name} is not a readable regular file: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise RecordError(f"{path.name} is not a regular file")
+        chunks = []
+        while chunk := os.read(fd, 1 << 20):
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    try:
+        text = b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RecordError(f"{path.name} is not valid UTF-8") from exc
+    if text and not text.endswith("\n"):
+        # A final line without its delimiter is silently glued to the next
+        # append, producing `}{` on one line and wedging every later read (SC-3).
+        raise RecordError(
+            f"{path.name}: store does not end with a newline; "
+            f"the last line is incomplete or was truncated"
+        )
+    return text
 
 
 def scan_records(paths):
     """Parse stored lines without field validation: JSON damage is loud, schema drift is not."""
     for path in paths:
-        try:
-            text = path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            raise RecordError(f"{path} does not exist") from None
+        text = _read_store_text(path)
         for number, line in enumerate(text.splitlines(), 1):
             if not line.strip():
                 continue
@@ -761,89 +869,141 @@ def scan_records(paths):
             yield path, number, item
 
 
+class StoreIndex:
+    """Every invariant the write path needs, built in ONE pass over the store.
+
+    Three separate whole-store scans per write made record N cost Θ(N) parses
+    and the store Θ(N²) to build (SC-6). This is still a full scan per write —
+    a real index is deferred and stated in the README — but it is one, not three.
+
+    Every key is `(origin, ...)`: `run_id` is unique *within* an origin
+    (crosswalk §1), so keying without it collides two independent origins that
+    happen to share a run name (SC-4).
+    """
+
+    def __init__(self) -> None:
+        self.event_ids: set[object] = set()
+        self.intent_runs: set[tuple[object, object]] = set()
+        self.session_ordinals: set[tuple[object, object, object]] = set()
+        self.session_counts: Counter = Counter()
+        self.outcome_ordinals: dict[tuple[object, object], set[object]] = {}
+        self.terminal_runs: set[tuple[object, object]] = set()
+
+    def add(self, item: dict[str, object]) -> str | None:
+        """Fold one stored record in; returns a complaint string, or None."""
+        event_id = item.get("event_id")
+        if event_id in self.event_ids:
+            return "duplicate event_id"
+        self.event_ids.add(event_id)
+        origin = origin_of(item)
+        run_key = (origin, item.get("run_id"))
+        kind = item.get("kind")
+        if kind == "intent":
+            if run_key in self.intent_runs:
+                return "duplicate (origin, run_id) intent"
+            self.intent_runs.add(run_key)
+            session_key = (origin, item.get("session_id"), item.get("spawn_ordinal"))
+            if session_key in self.session_ordinals:
+                return "duplicate (origin, session_id, spawn_ordinal)"
+            self.session_ordinals.add(session_key)
+            self.session_counts[(origin, item.get("session_id"))] += 1
+        elif kind == "outcome":
+            ordinals = self.outcome_ordinals.setdefault(run_key, set())
+            ordinal = item.get("outcome_ordinal")
+            if ordinal in ordinals:
+                return "duplicate (run_id, outcome_ordinal)"
+            ordinals.add(ordinal)
+            if item.get("terminal") is True:
+                if run_key in self.terminal_runs:
+                    return "second terminal outcome for run_id"
+                self.terminal_runs.add(run_key)
+        return None
+
+    def next_spawn_ordinal(self, origin: object, session_id: object) -> int:
+        # Counted over the WHOLE store: a session crossing a month boundary
+        # otherwise restarts at 0 and collides with its own earlier spawns (F-4).
+        # Records with no `session_id` share one per-origin bucket keyed `None`
+        # — "unsessioned" is a session for counting purposes, and the
+        # (origin, None, ordinal) uniqueness rule applies to it unchanged (SC-5).
+        return self.session_counts[(origin, session_id)]
+
+    def next_outcome_ordinal(self, origin: object, run_id: object) -> int:
+        ordinals = [o for o in self.outcome_ordinals.get((origin, run_id), ()) if type(o) is int]
+        return max(ordinals) + 1 if ordinals else 0
+
+
+def index_store(home: Path) -> StoreIndex:
+    index = StoreIndex()
+    for path, number, item in scan_records(store_files(home)):
+        complaint = index.add(item)
+        if complaint is not None:
+            raise RecordError(f"{path.name} line {number}: {complaint}")
+    return index
+
+
 def read_records(paths) -> list[dict[str, object]]:
-    """Strict read: every line validated, ids unique, one terminal outcome per run."""
+    """Strict read: every line validated, and every cross-record invariant held."""
     records: list[dict[str, object]] = []
-    seen: set[object] = set()
-    terminals: set[object] = set()
-    join_keys: set[tuple[object, object]] = set()
+    index = StoreIndex()
     for path, number, item in scan_records(paths):
         try:
             record = validate_record(item)
         except RecordError as exc:
             raise RecordError(f"{path.name} line {number}: {exc}") from exc
-        if record["event_id"] in seen:
-            raise RecordError(f"{path.name} line {number}: duplicate event_id")
-        seen.add(record["event_id"])
-        if record["kind"] == "outcome":
-            join_key = (record["run_id"], record["outcome_ordinal"])
-            if join_key in join_keys:
-                raise RecordError(
-                    f"{path.name} line {number}: duplicate (run_id, outcome_ordinal)"
-                )
-            join_keys.add(join_key)
-            if record["terminal"] is True:
-                if record["run_id"] in terminals:
-                    raise RecordError(
-                        f"{path.name} line {number}: second terminal outcome for run_id"
-                    )
-                terminals.add(record["run_id"])
+        complaint = index.add(record)
+        if complaint is not None:
+            raise RecordError(f"{path.name} line {number}: {complaint}")
         records.append(record)
     return records
 
 
-def _next_spawn_ordinal(home: Path, record: dict[str, object]) -> int:
-    """Counted over the WHOLE store, not the current month: a session running
-    across a month boundary otherwise restarts at 0 and silently collides with
-    its own earlier spawns (R1 F-4). The duplicate-id scan already pays this cost.
-    """
-    session = record.get("session_id")
-    count = 0
-    for _, _, item in scan_records(store_files(home)):
-        if item.get("kind") == "intent" and item.get("session_id") == session:
-            count += 1
-    return count
+def _resolve_intent(index: StoreIndex, record: dict[str, object]) -> None:
+    origin = origin_of(record)
+    run_key = (origin, record.get("run_id"))
+    if run_key in index.intent_runs:
+        # One intent per delegated unit: a second is either a re-spawn that
+        # needs its own run_id, or a double-write (SC-5).
+        raise RecordError(
+            f"run_id {record.get('run_id')!r} already has an intent for origin {origin!r}"
+        )
+    session_id = record.get("session_id")
+    if "spawn_ordinal" not in record:
+        record["spawn_ordinal"] = index.next_spawn_ordinal(origin, session_id)
+    if (origin, session_id, record["spawn_ordinal"]) in index.session_ordinals:
+        raise RecordError(
+            f"session {session_id!r} already has spawn_ordinal "
+            f"{record['spawn_ordinal']!r} for origin {origin!r}"
+        )
 
 
-def _resolve_outcome(home: Path, record: dict[str, object], *, allow_orphan: bool) -> None:
+def _resolve_outcome(index: StoreIndex, record: dict[str, object], *, allow_orphan: bool) -> None:
+    origin = origin_of(record)
     run_id = record.get("run_id")
-    intents = 0
-    ordinals: list[int] = []
-    terminals = 0
-    for _, _, item in scan_records(store_files(home)):
-        if item.get("run_id") != run_id:
-            continue
-        if item.get("kind") == "intent":
-            intents += 1
-        elif item.get("kind") == "outcome":
-            ordinal = item.get("outcome_ordinal")
-            if type(ordinal) is int:
-                ordinals.append(ordinal)
-            if item.get("terminal") is True:
-                terminals += 1
+    run_key = (origin, run_id)
     # `orphan` states what the store showed at write time, so the writer owns it
     # outright — a caller-supplied value would be an unverifiable claim.
     record.pop("orphan", None)
-    if not intents:
+    if run_key not in index.intent_runs:
         if not allow_orphan:
             raise RecordError(
-                f"no intent record for run_id {run_id!r}; pass --allow-orphan to record it anyway"
+                f"no intent record for run_id {run_id!r} in origin {origin!r}; "
+                f"pass --allow-orphan to record it anyway"
             )
         record["orphan"] = True
     if "outcome_ordinal" not in record:
-        record["outcome_ordinal"] = max(ordinals) + 1 if ordinals else 0
-    elif record["outcome_ordinal"] in ordinals:
-        # (run_id, outcome_ordinal) is the §3 join key — a silent collision fans
-        # the join out (R1 F-5).
+        record["outcome_ordinal"] = index.next_outcome_ordinal(origin, run_id)
+    elif record["outcome_ordinal"] in index.outcome_ordinals.get(run_key, ()):
+        # (origin, run_id, outcome_ordinal) is the §3 join key — a silent
+        # collision fans the join out (R1 F-5).
         raise RecordError(
             f"run_id {run_id!r} already carries outcome_ordinal {record['outcome_ordinal']!r}"
         )
-    if record.get("terminal") is True and terminals:
+    if record.get("terminal") is True and run_key in index.terminal_runs:
         raise RecordError(f"run_id {run_id!r} already carries a terminal outcome")
 
 
 def _prepare(
-    home: Path, raw: dict[str, object], *, aliases: dict[str, str], allow_orphan: bool
+    index: StoreIndex, raw: dict[str, object], *, aliases: dict[str, str], allow_orphan: bool
 ) -> dict[str, object]:
     record = dict(raw)
     record.setdefault("v", V)
@@ -855,10 +1015,10 @@ def _prepare(
         record.setdefault("attestation", ATTESTATION)
         record.setdefault("projection", PROJECTION)
         _normalize_bindings(record, aliases)
-    if kind == "intent" and "spawn_ordinal" not in record:
-        record["spawn_ordinal"] = _next_spawn_ordinal(home, record)
+    if kind == "intent":
+        _resolve_intent(index, record)
     if kind == "outcome":
-        _resolve_outcome(home, record, allow_orphan=allow_orphan)
+        _resolve_outcome(index, record, allow_orphan=allow_orphan)
     return record
 
 
@@ -869,11 +1029,31 @@ def _append(path: Path, record: dict[str, object]) -> None:
     store, so the pre-write size is captured and restored before raising. The
     caller holds the lock, so nothing else can have appended in between and the
     truncation can only discard our own partial bytes (R1 F-7).
+
+    The file is opened `O_NOFOLLOW` and confirmed a regular file before any
+    byte is written, and its mode is forced to 0600 — a pre-existing store could
+    otherwise be a symlink redirecting the append outside the home, or a
+    world-readable file left at its inherited mode (SC-8).
     """
-    payload = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-    size = path.stat().st_size if path.exists() else 0
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    payload = (
+        json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+    ).encode("utf-8")
     try:
+        # O_NONBLOCK: opening a FIFO for write otherwise blocks until a reader
+        # appears. Cleared below once the target is confirmed a regular file.
+        fd = os.open(
+            path,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
+        )
+    except OSError as exc:
+        raise RecordError(f"cannot open {path.name} for append: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise RecordError(f"{path.name} is not a regular file")
+        os.set_blocking(fd, True)
+        os.fchmod(fd, 0o600)
+        size = os.fstat(fd).st_size
         written = os.write(fd, payload)
         if written != len(payload):
             os.ftruncate(fd, size)
@@ -882,7 +1062,19 @@ def _append(path: Path, record: dict[str, object]) -> None:
                 f"short append to {path.name} ({written}/{len(payload)} bytes); "
                 f"rolled back to {size} bytes"
             )
-        os.fsync(fd)
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            # The bytes are in the file but may not be durable, and we cannot
+            # tell which. Retrying with a fresh event_id would create a second
+            # semantic record for one delegation, so hand the id back and let
+            # the caller reconcile with it (SC-10).
+            raise UnknownCommitError(
+                f"UNKNOWN COMMIT: {record['event_id']} was written to {path.name} but "
+                f"fsync failed ({exc}); the line may or may not be durable. Inspect the "
+                f"store and, if retrying, reuse this event_id — do not mint a new one.",
+                str(record["event_id"]),
+            ) from exc
     finally:
         os.close(fd)
 
@@ -899,11 +1091,15 @@ def write_record(
     ensure_home(home)
     aliases = load_aliases(home)
     with store_lock(home, timeout):
-        record = _prepare(home, raw, aliases=aliases, allow_orphan=allow_orphan)
+        # ONE scan, under the lock: it carries the duplicate-id check, both
+        # ordinal derivations, and every uniqueness invariant (SC-6). It also
+        # fails closed on a store whose last line lacks its newline, before any
+        # byte is appended to it (SC-3).
+        index = index_store(home)
+        record = _prepare(index, raw, aliases=aliases, allow_orphan=allow_orphan)
         record = validate_record(record)
-        for _, _, item in scan_records(store_files(home)):
-            if item.get("event_id") == record["event_id"]:
-                raise RecordError("duplicate event_id")
+        if record["event_id"] in index.event_ids:
+            raise RecordError("duplicate event_id")
         _append(store_path(home, str(record["ts"])), record)
     return record
 
@@ -913,7 +1109,11 @@ def summarize(home: Path) -> dict[str, object]:
     return {
         "v": V,
         "record_count": len(records),
-        "run_count": len({record["run_id"] for record in records if "run_id" in record}),
+        # Keyed by (origin, run_id): the same run name under two origins is two
+        # runs, not one (SC-4).
+        "run_count": len(
+            {(origin_of(record), record["run_id"]) for record in records if "run_id" in record}
+        ),
         "by_kind": dict(Counter(str(record["kind"]) for record in records)),
         "by_disposition": dict(
             Counter(str(record["disposition"]) for record in records if "disposition" in record)
@@ -1189,6 +1389,12 @@ def main(argv: list[str] | None = None) -> int:
     home = home_path(args.home)
     try:
         return args.handler(args, home)
+    except UnknownCommitError as exc:
+        # Distinct exit code: this is NOT "the write failed". A caller that
+        # retries a 1 blindly would be right; retrying this one blindly mints a
+        # duplicate record (SC-10).
+        print(f"intent-writer: {exc}", file=sys.stderr)
+        return EXIT_UNKNOWN_COMMIT
     except (OSError, json.JSONDecodeError, RecordError) as exc:
         print(f"intent-writer: {exc}", file=sys.stderr)
         return 1

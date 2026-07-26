@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,6 +35,7 @@ from intent_writer import (
     load_aliases,
     main,
     normalize_model,
+    origin_of,
     read_records,
     store_files,
     store_lock,
@@ -126,6 +128,13 @@ class StoreTestCase(unittest.TestCase):
 
 
 class UlidTests(unittest.TestCase):
+    def setUp(self):
+        # The generator is monotonic across calls, so its state has to be reset
+        # or an earlier test's millisecond clamps this one's.
+        patch = unittest.mock.patch.object(intent_writer, "_ULID_LAST", None)
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_ulid_is_26_crockford_characters(self):
         value = ulid()
         self.assertEqual(len(value), 26)
@@ -136,7 +145,8 @@ class UlidTests(unittest.TestCase):
 
     def test_ulid_prefix_encodes_the_supplied_millisecond(self):
         self.assertEqual(ulid_time_ms(ulid(now_ms=1_782_885_929_454)), 1_782_885_929_454)
-        self.assertEqual(ulid_time_ms(ulid(now_ms=0)), 0)
+        with unittest.mock.patch.object(intent_writer, "_ULID_LAST", None):
+            self.assertEqual(ulid_time_ms(ulid(now_ms=0)), 0)
 
     def test_ulids_sort_in_time_order(self):
         early = ulid(now_ms=1_000_000_000_000)
@@ -605,8 +615,13 @@ class LockTests(StoreTestCase):
     def test_the_lock_is_released_when_the_block_exits(self):
         self.home.mkdir(parents=True)
         with store_lock(self.home) as lock:
-            self.assertTrue(lock.path.exists())
-        self.assertFalse((self.home / LOCK_NAME).exists())
+            self.assertIsNotNone(lock.fd)
+        # The lock FILE persists by design — unlinking it would let a later
+        # writer lock a different inode while a holder still has the old one.
+        # What must be released is the flock, so re-acquiring is the assertion.
+        self.assertTrue((self.home / LOCK_NAME).exists())
+        with store_lock(self.home, timeout=0.05) as again:
+            self.assertIsNotNone(again.fd)
 
     def test_a_held_lock_makes_a_second_writer_give_up_rather_than_interleave(self):
         self.home.mkdir(parents=True)
@@ -615,16 +630,54 @@ class LockTests(StoreTestCase):
                 with store_lock(self.home, timeout=0.05):
                     self.fail("the second writer must not acquire a held lock")
 
-    def test_a_stale_lock_is_reclaimed_rather_than_wedging_the_store(self):
+    def test_an_old_lock_file_does_not_confer_the_lock(self):
+        # Under the retired sentinel protocol an old mtime meant "reclaim me",
+        # which is exactly what raced (SC-1). A stale FILE is now just a file:
+        # the kernel decides who holds it, and nobody does here.
         self.home.mkdir(parents=True)
         stale = self.home / LOCK_NAME
         stale.write_text("", encoding="utf-8")
-        import os as _os
-
-        _os.utime(stale, (0, 0))
+        os.utime(stale, (0, 0))
         with store_lock(self.home, timeout=0.05):
             pass
-        self.assertFalse(stale.exists())
+        write_record(self.home, intent())
+        self.assertEqual(len(self.lines()), 1)
+
+    def test_a_long_held_lock_is_never_stolen_however_old_it_looks(self):
+        # The 30s lease is gone, so a writer that legitimately takes longer than
+        # any timeout keeps its lock instead of having it reclaimed underneath.
+        self.home.mkdir(parents=True)
+        with store_lock(self.home):
+            os.utime(self.home / LOCK_NAME, (0, 0))
+            with self.assertRaisesRegex(RecordError, "lock"):
+                store_lock(self.home, timeout=0.05).__enter__()
+
+    def test_the_lock_is_released_when_the_holding_process_dies(self):
+        self.home.mkdir(parents=True)
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys,time;sys.path.insert(0,%r)\n"
+                "from pathlib import Path\n"
+                "from intent_writer import store_lock\n"
+                "lock = store_lock(Path(%r)); lock.__enter__()\n"
+                "print('held', flush=True); time.sleep(60)\n"
+                % (str(ENTRYPOINT.parent), str(self.home)),
+            ],
+            stdout=subprocess.PIPE,
+        )
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), b"held")
+            with self.assertRaisesRegex(RecordError, "lock"):
+                store_lock(self.home, timeout=0.05).__enter__()
+        finally:
+            holder.kill()
+            holder.wait(timeout=30)
+            holder.stdout.close()
+        # The kernel released it on process death — no lease had to expire.
+        with store_lock(self.home, timeout=2.0):
+            pass
 
     def test_concurrent_writers_produce_whole_lines_and_no_lost_records(self):
         writer = (
@@ -1278,32 +1331,31 @@ class DurableWriteTests(StoreTestCase):
         self.assertEqual(path.stat().st_size, before)
         self.assertEqual(len(read_records(store_files(self.home))), 1)
 
-    def test_a_writer_does_not_release_a_sentinel_it_no_longer_owns(self):
+    def test_a_second_holder_cannot_exist_while_the_first_is_inside(self):
+        # The retired protocol let two writers that both saw a stale sentinel
+        # each unlink and claim. There is no reclaim path to race now (SC-1).
         self.home.mkdir(parents=True)
         first = store_lock(self.home)
         first.__enter__()
-        os.utime(self.home / LOCK_NAME, (0, 0))
-        second = store_lock(self.home, timeout=0.5)
-        second.__enter__()
         try:
-            first.__exit__()
-            self.assertTrue((self.home / LOCK_NAME).exists())
-            with self.assertRaisesRegex(RecordError, "lock"):
-                store_lock(self.home, timeout=0.05).__enter__()
+            os.utime(self.home / LOCK_NAME, (0, 0))
+            for _ in range(3):
+                with self.assertRaisesRegex(RecordError, "lock"):
+                    store_lock(self.home, timeout=0.02).__enter__()
         finally:
-            second.__exit__()
-        self.assertFalse((self.home / LOCK_NAME).exists())
+            first.__exit__()
+        with store_lock(self.home, timeout=0.05):
+            pass
 
-    def test_the_sentinel_carries_a_pid_and_nonce(self):
+    def test_releasing_closes_the_descriptor(self):
         self.home.mkdir(parents=True)
-        with store_lock(self.home) as lock:
-            token = lock.path.read_text(encoding="utf-8")
-        pid, _, nonce = token.partition(":")
-        self.assertEqual(int(pid), os.getpid())
-        self.assertEqual(len(nonce), 16)
-
-    def test_two_locks_in_the_same_process_get_distinct_tokens(self):
-        self.assertNotEqual(store_lock(self.home).token, store_lock(self.home).token)
+        lock = store_lock(self.home)
+        lock.__enter__()
+        held = lock.fd
+        lock.__exit__()
+        self.assertIsNone(lock.fd)
+        with self.assertRaises(OSError):
+            os.fstat(held)
 
 
 class CliSurfaceTests(StoreTestCase):
@@ -1441,6 +1493,452 @@ class AliasDataFileTests(StoreTestCase):
         )
         self.assertEqual(record["requested_model"]["id"], "google:gemini-3.6-flash-high")
         self.assertEqual(record["requested_model"]["raw"], "flash")
+
+
+class NonFiniteNumberTests(StoreTestCase):
+    """SC-2 / gap 4: non-finite floats emit `NaN`, which is not JSON."""
+
+    def test_non_finite_cost_is_rejected(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(bad=bad), self.assertRaisesRegex(RecordError, "finite"):
+                validate_record(complete(outcome(cost_usd=bad)))
+
+    def test_non_finite_prices_are_rejected(self):
+        for field in ("price_per_mtok_in", "price_per_mtok_out"):
+            price = {
+                "binding": "anthropic:claude-opus-5",
+                "price_per_mtok_in": 15.0,
+                "price_per_mtok_out": 75.0,
+                "as_of": "2026-07-24",
+            }
+            price[field] = float("nan")
+            with self.subTest(field=field), self.assertRaisesRegex(RecordError, "finite"):
+                validate_record(complete(intent(price_lineage=price)))
+
+    def test_finite_costs_still_pass(self):
+        for good in (0, 0.0, 12.5, 1e6):
+            with self.subTest(good=good):
+                validate_record(complete(outcome(cost_usd=good)))
+
+    def test_a_non_finite_value_never_reaches_the_store(self):
+        with self.assertRaises(RecordError):
+            write_record(self.home, outcome(cost_usd=float("nan")), allow_orphan=True)
+        self.assertEqual(store_files(self.home), [])
+
+    def test_the_store_round_trips_through_a_strict_json_reader(self):
+        write_record(self.home, intent())
+        write_record(self.home, outcome(cost_usd=1.5))
+        for line in store_files(self.home)[0].read_text(encoding="utf-8").splitlines():
+            json.loads(line, parse_constant=self._reject_constant)
+
+    @staticmethod
+    def _reject_constant(name):
+        raise AssertionError(f"non-JSON constant {name!r} in the store")
+
+
+class TrailingNewlineTests(StoreTestCase):
+    """SC-3 / gap 5: a final line without `\\n` is glued to the next append."""
+
+    def _write_without_newline(self) -> Path:
+        write_record(self.home, intent())
+        path = store_files(self.home)[0]
+        text = path.read_text(encoding="utf-8")
+        path.write_text(text.rstrip("\n"), encoding="utf-8")
+        return path
+
+    def test_validate_fails_closed_on_a_newline_less_store(self):
+        self._write_without_newline()
+        code, _, err = self.run_cli("validate")
+        self.assertEqual(code, 1)
+        self.assertIn("does not end with a newline", err)
+
+    def test_a_write_refuses_rather_than_gluing_two_records_together(self):
+        path = self._write_without_newline()
+        before = path.read_text(encoding="utf-8")
+        with self.assertRaisesRegex(RecordError, "does not end with a newline"):
+            write_record(self.home, intent(run_id="run-2"))
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+        self.assertNotIn("}{", path.read_text(encoding="utf-8"))
+
+    def test_a_normal_store_ends_with_a_newline(self):
+        write_record(self.home, intent())
+        self.assertTrue(store_files(self.home)[0].read_text(encoding="utf-8").endswith("\n"))
+
+    def test_an_empty_store_file_is_not_a_newline_error(self):
+        self.home.mkdir(parents=True)
+        (self.home / "intents-2026-07.jsonl").write_text("", encoding="utf-8")
+        code, _, _ = self.run_cli("validate")
+        self.assertEqual(code, 0)
+
+
+class CrossOriginTests(StoreTestCase):
+    """SC-4 / gap 6: `run_id` is unique within an origin, not globally."""
+
+    def test_an_outcome_does_not_attach_to_another_origins_intent(self):
+        write_record(self.home, intent(origin="origin-a", run_id="r"))
+        with self.assertRaisesRegex(RecordError, "no intent record"):
+            write_record(self.home, outcome(origin="origin-b", run_id="r"))
+
+    def test_each_origin_keeps_its_own_ordinal_sequence(self):
+        write_record(self.home, intent(origin="origin-a", run_id="r"))
+        write_record(self.home, intent(origin="origin-b", run_id="r"))
+        first = write_record(self.home, outcome(origin="origin-a", run_id="r"))
+        second = write_record(self.home, outcome(origin="origin-b", run_id="r"))
+        self.assertEqual(first["outcome_ordinal"], 0)
+        self.assertEqual(second["outcome_ordinal"], 0)
+
+    def test_each_origin_may_carry_its_own_terminal_outcome(self):
+        write_record(self.home, intent(origin="origin-a", run_id="r"))
+        write_record(self.home, intent(origin="origin-b", run_id="r"))
+        write_record(self.home, outcome(origin="origin-a", run_id="r", terminal=True))
+        write_record(self.home, outcome(origin="origin-b", run_id="r", terminal=True))
+        self.assertEqual(len(self.lines()), 4)
+
+    def test_an_omitted_origin_is_the_same_run_as_an_explicit_local(self):
+        write_record(self.home, intent(run_id="r"))
+        with self.assertRaisesRegex(RecordError, "already has an intent"):
+            write_record(self.home, intent(origin="local", run_id="r"))
+
+    def test_the_omitted_origin_is_not_stamped_into_the_record(self):
+        # Crosswalk §1 keeps "may omit" true on disk; `local` is implied, not written.
+        record = write_record(self.home, intent())
+        self.assertNotIn("origin", record)
+        self.assertEqual(origin_of(record), "local")
+
+    def test_each_origin_counts_its_own_spawn_ordinals(self):
+        first = write_record(self.home, intent(origin="origin-a", run_id="a", session_id="s"))
+        second = write_record(self.home, intent(origin="origin-b", run_id="b", session_id="s"))
+        self.assertEqual([first["spawn_ordinal"], second["spawn_ordinal"]], [0, 0])
+
+
+class IntentIdentityTests(StoreTestCase):
+    """SC-5 / gaps 7 and 8."""
+
+    def test_a_second_intent_for_one_run_is_refused(self):
+        write_record(self.home, intent(run_id="r"))
+        with self.assertRaisesRegex(RecordError, "already has an intent"):
+            write_record(self.home, intent(run_id="r"))
+        self.assertEqual(len(self.lines()), 1)
+
+    def test_a_duplicate_session_ordinal_is_refused(self):
+        write_record(self.home, intent(run_id="a", session_id="s", spawn_ordinal=0))
+        with self.assertRaisesRegex(RecordError, "already has spawn_ordinal"):
+            write_record(self.home, intent(run_id="b", session_id="s", spawn_ordinal=0))
+
+    def test_an_explicit_ordinal_that_does_not_collide_is_kept(self):
+        write_record(self.home, intent(run_id="a", session_id="s", spawn_ordinal=0))
+        record = write_record(self.home, intent(run_id="b", session_id="s", spawn_ordinal=7))
+        self.assertEqual(record["spawn_ordinal"], 7)
+
+    def test_unsessioned_intents_share_one_bucket_per_origin(self):
+        # Defined behavior (SC-5): absent `session_id` is its own bucket keyed
+        # None, counted and uniqueness-checked exactly like a named session.
+        first = write_record(self.home, intent(run_id="a"))
+        second = write_record(self.home, intent(run_id="b"))
+        self.assertEqual([first["spawn_ordinal"], second["spawn_ordinal"]], [0, 1])
+        with self.assertRaisesRegex(RecordError, "already has spawn_ordinal"):
+            write_record(self.home, intent(run_id="c", spawn_ordinal=0))
+
+    def test_an_unsessioned_bucket_is_separate_from_a_named_session(self):
+        write_record(self.home, intent(run_id="a"))
+        record = write_record(self.home, intent(run_id="b", session_id="s"))
+        self.assertEqual(record["spawn_ordinal"], 0)
+
+    def test_validate_catches_duplicate_intent_identities_written_around_the_writer(self):
+        write_record(self.home, intent(run_id="r", session_id="s"))
+        path = store_files(self.home)[0]
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(complete(intent(run_id="r", session_id="s"))) + "\n")
+        code, _, err = self.run_cli("validate")
+        self.assertEqual(code, 1)
+        self.assertIn("duplicate (origin, run_id) intent", err)
+
+    def test_validate_catches_a_duplicate_session_ordinal_written_around_the_writer(self):
+        write_record(self.home, intent(run_id="a", session_id="s"))
+        path = store_files(self.home)[0]
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(complete(intent(run_id="b", session_id="s"), spawn_ordinal=0)) + "\n"
+            )
+        code, _, err = self.run_cli("validate")
+        self.assertEqual(code, 1)
+        self.assertIn("duplicate (origin, session_id, spawn_ordinal)", err)
+
+
+class UlidOrderingTests(unittest.TestCase):
+    """SC-7 / gap 9."""
+
+    def setUp(self):
+        patch = unittest.mock.patch.object(intent_writer, "_ULID_LAST", None)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_an_overflow_form_ulid_is_rejected(self):
+        for bad in ("Z" * 26, "8" + "0" * 25, "A" + "0" * 25):
+            with self.subTest(bad=bad), self.assertRaisesRegex(RecordError, "overflow-form"):
+                ulid_time_ms(bad)
+
+    def test_the_overflow_form_is_rejected_as_a_record_field(self):
+        with self.assertRaisesRegex(RecordError, "overflow-form"):
+            validate_record(complete(intent(), event_id="Z" * 26))
+
+    def test_every_canonical_first_character_is_accepted(self):
+        for lead in "01234567":
+            with self.subTest(lead=lead):
+                ulid_time_ms(lead + "0" * 25)
+
+    def test_a_same_millisecond_burst_stays_strictly_increasing(self):
+        burst = [ulid(now_ms=1_700_000_000_000) for _ in range(200)]
+        self.assertEqual(burst, sorted(burst))
+        self.assertEqual(len(set(burst)), len(burst))
+
+    def test_a_clock_regression_does_not_produce_a_decreasing_id(self):
+        forward = ulid(now_ms=1_700_000_000_000)
+        backward = ulid(now_ms=1_600_000_000_000)
+        self.assertGreater(backward, forward)
+        self.assertEqual(ulid_time_ms(backward), 1_700_000_000_000)
+
+    def test_entropy_exhaustion_rolls_into_the_next_millisecond(self):
+        with unittest.mock.patch.object(
+            intent_writer, "_ULID_LAST", (1_700_000_000_000, intent_writer.ULID_MAX_ENTROPY)
+        ):
+            rolled = ulid(now_ms=1_700_000_000_000)
+        self.assertEqual(ulid_time_ms(rolled), 1_700_000_000_001)
+
+    def test_a_later_millisecond_still_wins_normally(self):
+        early = ulid(now_ms=1_700_000_000_000)
+        late = ulid(now_ms=1_700_000_000_050)
+        self.assertLess(early, late)
+        self.assertEqual(ulid_time_ms(late), 1_700_000_000_050)
+
+    def test_written_records_carry_ids_consistent_with_their_timestamps(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        home = Path(temp.name) / "v2"
+        first = write_record(home, intent(run_id="a"))
+        second = write_record(home, intent(run_id="b"))
+        self.assertLess(first["event_id"], second["event_id"])
+        self.assertLessEqual(first["ts"], second["ts"])
+
+
+class FilesystemSafetyTests(StoreTestCase):
+    """SC-8 / gap 11."""
+
+    def test_a_permissive_pre_existing_store_is_tightened_on_write(self):
+        self.home.mkdir(parents=True)
+        path = self.home / "intents-2026-07.jsonl"
+        path.write_text("", encoding="utf-8")
+        os.chmod(path, 0o644)
+        write_record(self.home, intent(ts="2026-07-26T12:00:00Z"))
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_a_symlinked_store_is_refused_rather_than_followed(self):
+        self.home.mkdir(parents=True)
+        outside = Path(self.temp.name) / "outside.jsonl"
+        outside.write_text("", encoding="utf-8")
+        (self.home / "intents-2026-07.jsonl").symlink_to(outside)
+        with self.assertRaises(RecordError):
+            write_record(self.home, intent(ts="2026-07-26T12:00:00Z"))
+        self.assertEqual(outside.read_text(encoding="utf-8"), "")
+
+    def test_a_symlinked_store_is_refused_on_read(self):
+        self.home.mkdir(parents=True)
+        outside = Path(self.temp.name) / "outside.jsonl"
+        outside.write_text("", encoding="utf-8")
+        (self.home / "intents-2026-07.jsonl").symlink_to(outside)
+        code, _, err = self.run_cli("validate")
+        self.assertEqual(code, 1)
+        self.assertIn("regular file", err)
+
+    def test_a_fifo_in_the_store_position_is_refused(self):
+        self.home.mkdir(parents=True)
+        os.mkfifo(self.home / "intents-2026-07.jsonl")
+        code, _, err = self.run_cli("validate")
+        self.assertEqual(code, 1)
+        self.assertIn("regular file", err)
+
+    def test_the_lock_file_is_not_followed_through_a_symlink(self):
+        self.home.mkdir(parents=True)
+        outside = Path(self.temp.name) / "outside.lock"
+        (self.home / LOCK_NAME).symlink_to(outside)
+        with self.assertRaises((RecordError, OSError)):
+            with store_lock(self.home, timeout=0.05):
+                pass
+
+
+class UnicodeAndDateTests(unittest.TestCase):
+    """SC-9 / gap 12."""
+
+    def test_a_shape_valid_but_impossible_date_is_rejected(self):
+        for bad in ("2026-99-99", "2026-02-30", "2026-13-01", "2026-00-10"):
+            price = {
+                "binding": "anthropic:claude-opus-5",
+                "price_per_mtok_in": 15,
+                "price_per_mtok_out": 75,
+                "as_of": bad,
+            }
+            with self.subTest(bad=bad), self.assertRaisesRegex(RecordError, "as_of"):
+                validate_record(complete(intent(price_lineage=price)))
+
+    def test_a_real_leap_day_is_accepted(self):
+        price = {
+            "binding": "anthropic:claude-opus-5",
+            "price_per_mtok_in": 15,
+            "price_per_mtok_out": 75,
+            "as_of": "2028-02-29",
+        }
+        validate_record(complete(intent(price_lineage=price)))
+
+    def test_lone_surrogates_are_rejected_in_display_text(self):
+        with self.assertRaisesRegex(RecordError, "surrogate"):
+            validate_record(complete(intent(task_class={"class": None, "class_free": "\ud800x"})))
+        with self.assertRaisesRegex(RecordError, "surrogate"):
+            validate_record(
+                complete(
+                    intent(
+                        harness_contract={
+                            "sha256": SHA,
+                            "label": "lab\udfffel",
+                            "features": {
+                                "review_gate": True,
+                                "claim_tagging": True,
+                                "tool_profile": "ro",
+                            },
+                        }
+                    )
+                )
+            )
+
+    def test_bidi_overrides_are_rejected_in_display_text(self):
+        for bad in ("safe‮reversed", "‭label", "a⁦b", "x‏y"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(RecordError, "bidirectional"):
+                validate_record(
+                    complete(intent(task_class={"class": None, "class_free": bad}))
+                )
+
+    def test_ordinary_non_ascii_text_is_still_accepted(self):
+        for good in ("révision-de-portée", "レビュー", "naïve-implementation"):
+            with self.subTest(good=good):
+                validate_record(
+                    complete(intent(task_class={"class": None, "class_free": good}))
+                )
+
+    def test_free_slots_and_raw_spellings_are_covered_too(self):
+        with self.assertRaisesRegex(RecordError, "bidirectional"):
+            validate_record(complete(intent(reason_code="other", reason_code_free="a‮b")))
+        with self.assertRaisesRegex(RecordError, "surrogate"):
+            validate_record(
+                complete(intent(requested_model={"id": "anthropic:claude-opus-5", "raw": "\ud800"}))
+            )
+
+    def test_a_written_store_encodes_as_strict_utf8(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        home = Path(temp.name) / "v2"
+        write_record(home, intent(task_class={"class": None, "class_free": "révision"}))
+        raw = store_files(home)[0].read_bytes()
+        raw.decode("utf-8", errors="strict")
+
+
+class UnknownCommitTests(StoreTestCase):
+    """SC-10 / gap 3."""
+
+    def _failing_fsync(self, real):
+        def fake(fd):
+            info = os.fstat(fd)
+            if stat.S_ISREG(info.st_mode) and info.st_size:
+                raise OSError(5, "simulated I/O error")
+            return real(fd)
+
+        return fake
+
+    def test_an_fsync_failure_after_a_full_write_reports_unknown_commit(self):
+        real = os.fsync
+        with unittest.mock.patch.object(intent_writer.os, "fsync", self._failing_fsync(real)):
+            with self.assertRaises(intent_writer.UnknownCommitError) as caught:
+                write_record(self.home, intent())
+        self.assertIn("UNKNOWN COMMIT", str(caught.exception))
+        self.assertIn("reuse this event_id", str(caught.exception))
+
+    def test_the_error_carries_the_event_id_that_was_written(self):
+        real = os.fsync
+        with unittest.mock.patch.object(intent_writer.os, "fsync", self._failing_fsync(real)):
+            with self.assertRaises(intent_writer.UnknownCommitError) as caught:
+                write_record(self.home, intent())
+        event_id = caught.exception.event_id
+        self.assertEqual(len(event_id), 26)
+        # The line IS in the file — that is precisely why the id must come back.
+        self.assertEqual(self.lines()[0]["event_id"], event_id)
+
+    def test_the_cli_exits_with_the_distinct_unknown_commit_code(self):
+        real = os.fsync
+        with unittest.mock.patch.object(intent_writer.os, "fsync", self._failing_fsync(real)):
+            code, _, err = self.run_cli(
+                "record-intent", "--json", json.dumps(intent())
+            )
+        self.assertEqual(code, intent_writer.EXIT_UNKNOWN_COMMIT)
+        self.assertNotEqual(intent_writer.EXIT_UNKNOWN_COMMIT, 1)
+        self.assertIn("UNKNOWN COMMIT", err)
+
+    def test_a_blind_retry_of_the_same_intent_cannot_double_write(self):
+        real = os.fsync
+        with unittest.mock.patch.object(intent_writer.os, "fsync", self._failing_fsync(real)):
+            with self.assertRaises(intent_writer.UnknownCommitError):
+                write_record(self.home, intent())
+        # Two independent invariants stand in the way; the intent-identity rule
+        # (SC-5) happens to fire first because the run already has an intent.
+        with self.assertRaisesRegex(RecordError, "already has an intent"):
+            write_record(self.home, intent())
+        self.assertEqual(len(self.lines()), 1)
+
+    def test_reusing_the_returned_event_id_is_caught_as_a_duplicate_id(self):
+        real = os.fsync
+        with unittest.mock.patch.object(intent_writer.os, "fsync", self._failing_fsync(real)):
+            with self.assertRaises(intent_writer.UnknownCommitError) as caught:
+                write_record(self.home, intent(run_id="r"))
+        # Even under a different run_id, the returned id cannot be written twice.
+        with self.assertRaisesRegex(RecordError, "duplicate event_id"):
+            write_record(self.home, intent(run_id="other", event_id=caught.exception.event_id))
+        self.assertEqual(len(self.lines()), 1)
+
+
+class StoreVolumeTests(StoreTestCase):
+    """SC-6 / gap 10: one scan per write, and the cost of that scan stated."""
+
+    def test_a_write_scans_the_store_exactly_once(self):
+        write_record(self.home, intent(run_id="seed"))
+        calls = []
+        real = intent_writer._read_store_text
+
+        def counting(path):
+            calls.append(path)
+            return real(path)
+
+        with unittest.mock.patch.object(intent_writer, "_read_store_text", counting):
+            write_record(self.home, intent(run_id="next"))
+        self.assertEqual(len(calls), 1, f"expected one scan, got {len(calls)}")
+
+    def test_an_outcome_write_also_scans_once(self):
+        write_record(self.home, intent(run_id="r"))
+        calls = []
+        real = intent_writer._read_store_text
+
+        def counting(path):
+            calls.append(path)
+            return real(path)
+
+        with unittest.mock.patch.object(intent_writer, "_read_store_text", counting):
+            write_record(self.home, outcome(run_id="r"))
+        self.assertEqual(len(calls), 1)
+
+    def test_a_few_hundred_records_stay_consistent(self):
+        for i in range(200):
+            write_record(self.home, intent(run_id=f"r{i}", session_id="s"))
+        records = read_records(store_files(self.home))
+        self.assertEqual(len(records), 200)
+        self.assertEqual(
+            sorted(r["spawn_ordinal"] for r in records), list(range(200))
+        )
 
 
 if __name__ == "__main__":
