@@ -30,7 +30,9 @@ EFFORTS = frozenset(
         "unknown",
     }
 )
-SURFACES = frozenset({"pin", "per-call", "generic", "teams", "cowork"})
+# `cli` [v0.2.2]: a native shell CLI invocation (e.g. `agy -p`), outside any
+# Claude Code surface. Recording one as `pin`/`generic` would falsify the axis.
+SURFACES = frozenset({"pin", "per-call", "generic", "teams", "cowork", "cli"})
 DISPOSITIONS = frozenset(
     {
         "accepted",
@@ -56,7 +58,20 @@ REGISTERED_REASON_CODES: frozenset[str] = frozenset()
 REGISTERED_VALIDATOR_OUTCOMES: frozenset[str] = frozenset()
 REGISTERED_VALIDATION_ORACLES: frozenset[str] = frozenset()
 REGISTERED_CLOSURE_TARGETS: frozenset[str] = frozenset()
-REGISTERED_FRICTION_CODES: frozenset[str] = frozenset()
+# [v0.2.2] The first published vocabulary members: severe-failure classes.
+# The crosswalk pairs them with a "≥ third-party-verified attestation" rule —
+# NOT enforced here and deliberately so: this writer's `attestation` is the
+# fixed literal `driver-attested`, so enforcing the tier would make these three
+# unwritable by this module rather than gating them. The tier rule binds the
+# record SET a consumer reads across writers; it is documented, not validated.
+SEVERE_FAILURE_CODES = frozenset(
+    {"fabricated-completion", "silent-scope-violation", "undetected-omission"}
+)
+REGISTERED_FRICTION_CODES: frozenset[str] = SEVERE_FAILURE_CODES
+# Kept a separate registry: the §3 row groups the two fields because they share
+# the RULE, and does not say the three members belong to both vocabularies.
+# "Severe-failure class" reads as friction, not as a confounder, so the narrower
+# reading is taken here — widening is this one binding.
 REGISTERED_CONFOUNDER_CODES: frozenset[str] = frozenset()
 # Crosswalk §5.3 [v0.2.1]: native writers apply the free-code rule at WRITE
 # time, so a native store is exportable-by-construction. Scalar free-code

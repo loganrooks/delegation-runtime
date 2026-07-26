@@ -60,6 +60,13 @@ Model ids normalize to `vendor:model`. The alias table seeds from the crosswalk'
 `<home>/model-aliases.json` — a data file, not a code edit. An unrecognized alias is **rejected,
 never guessed**.
 
+The deployed `~/.delegation/v2/model-aliases.json` carries those three spellings plus
+`flash` → `google:gemini-3.6-flash-high`. **The bare `google:gemini-3.6-flash` is deliberately
+absent**: that id is not served (gateway README, verified 2026-07-26 — delegation-triage W-026),
+so no alias resolves to it. It remains a shape-valid binding, so a caller who passes it
+explicitly is recorded as asking for it rather than silently corrected — the writer records what
+was requested, it does not adjudicate what is servable.
+
 ## The rules that bite most often
 
 - **Free-code fields never take raw operational strings.** `reason_code`, `validation_oracle`,
@@ -87,6 +94,17 @@ never guessed**.
   binding or the literal `human`. **`note_hash`** (optional, intents) is a sha256 hex digest of
   an origin-local note; the note itself never enters the record.
 - **`orphan` is writer-stamped, never caller-asserted**, and is origin-local/non-exportable.
+- **The first three friction codes are registered** (crosswalk v0.2.2): `fabricated-completion`,
+  `silent-scope-violation`, `undetected-omission` — severe-failure classes, accepted bare
+  alongside `other`+free. The crosswalk pairs them with a "requires ≥ `third-party-verified`
+  attestation" rule; **this writer does not validate that rule, deliberately.** Its
+  `attestation` is the fixed literal `driver-attested`, so enforcing the tier here would make
+  the three members unwritable by this module rather than gating them. The tier rule binds the
+  record *set* a consumer reads across writers — it is documented here, not validated here.
+  Registered for `friction_codes` only; `confounder_codes` has no registered members yet (the
+  §3 row groups the two fields because they share the *rule*, not the vocabulary).
+- **`surface` includes `cli`** (v0.2.2) — a native shell CLI invocation such as `agy -p`,
+  outside any Claude Code surface. Recording one as `pin` or `generic` would falsify the axis.
 
 ## Limits worth knowing
 

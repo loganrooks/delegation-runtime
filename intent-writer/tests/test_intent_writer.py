@@ -23,6 +23,8 @@ from intent_writer import (
     IDENTITY_SOURCES,
     LOCK_NAME,
     PROJECTION,
+    REGISTERED_CONFOUNDER_CODES,
+    REGISTERED_FRICTION_CODES,
     REWORK_ACTORS,
     SURFACES,
     TOOL_PROFILES,
@@ -1302,6 +1304,143 @@ class DurableWriteTests(StoreTestCase):
 
     def test_two_locks_in_the_same_process_get_distinct_tokens(self):
         self.assertNotEqual(store_lock(self.home).token, store_lock(self.home).token)
+
+
+class CliSurfaceTests(StoreTestCase):
+    """Crosswalk v0.2.2: `surface` gains `cli`."""
+
+    def test_cli_is_a_surface_member(self):
+        self.assertIn("cli", SURFACES)
+
+    def test_a_cli_surface_intent_validates_and_writes(self):
+        record = write_record(self.home, intent(surface="cli"))
+        self.assertEqual(record["surface"], "cli")
+
+    def test_near_misses_are_still_rejected(self):
+        for bad in ("CLI", "shell", "cli ", "command-line"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(RecordError, "surface"):
+                validate_record(complete(intent(surface=bad)))
+
+    def test_the_cli_flag_offers_the_new_surface(self):
+        argv = list(CliTests.INTENT_ARGV)
+        argv[argv.index("--surface") + 1] = "cli"
+        code, _, err = self.run_cli(*argv, "--requested-model", "terra")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.lines()[0]["surface"], "cli")
+
+    def test_summarize_counts_the_new_surface(self):
+        write_record(self.home, intent(surface="cli"))
+        self.assertEqual(summarize(self.home)["by_surface"], {"cli": 1})
+
+
+class RegisteredFrictionCodeTests(unittest.TestCase):
+    """Crosswalk v0.2.2: the first three registered friction-code members."""
+
+    def test_the_three_severe_failure_classes_are_registered(self):
+        self.assertEqual(
+            sorted(REGISTERED_FRICTION_CODES),
+            ["fabricated-completion", "silent-scope-violation", "undetected-omission"],
+        )
+
+    def test_each_registered_member_is_accepted_bare(self):
+        for code in sorted(REGISTERED_FRICTION_CODES):
+            with self.subTest(code=code):
+                validate_record(complete(outcome(friction_codes=[code])))
+
+    def test_registered_members_mix_with_the_free_slot(self):
+        validate_record(
+            complete(
+                outcome(
+                    friction_codes=["fabricated-completion", "other"],
+                    friction_codes_free=[None, "something not yet registered"],
+                )
+            )
+        )
+
+    def test_a_free_slot_beside_a_registered_member_is_still_rejected(self):
+        with self.assertRaisesRegex(RecordError, r"friction_codes_free\[0\]"):
+            validate_record(
+                complete(
+                    outcome(
+                        friction_codes=["fabricated-completion"],
+                        friction_codes_free=["leaked text"],
+                    )
+                )
+            )
+
+    def test_an_unregistered_friction_code_is_still_rejected(self):
+        for bad in ("fabricated_completion", "Fabricated-Completion", "slow-reviewer"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(RecordError, "friction_codes"):
+                validate_record(complete(outcome(friction_codes=[bad])))
+
+    def test_the_confounder_registry_stays_empty_on_the_narrow_reading(self):
+        # The §3 row groups the two fields because they share the RULE; it does
+        # not say the three members belong to both vocabularies. If that reading
+        # is widened, this test is the one that should fail first.
+        self.assertEqual(REGISTERED_CONFOUNDER_CODES, frozenset())
+        with self.assertRaisesRegex(RecordError, "confounder_codes"):
+            validate_record(complete(outcome(confounder_codes=["fabricated-completion"])))
+        validate_record(
+            complete(
+                outcome(
+                    confounder_codes=["other"],
+                    confounder_codes_free=["fabricated completion, as a confounder"],
+                )
+            )
+        )
+
+    def test_the_attestation_tier_rule_is_not_enforced_by_this_writer(self):
+        # The crosswalk pairs these members with a >= third-party-verified
+        # requirement. This writer's attestation is the fixed literal
+        # `driver-attested`, so enforcing it here would make them unwritable
+        # rather than gated; the rule binds the record set consumers read.
+        record = validate_record(complete(outcome(friction_codes=["fabricated-completion"])))
+        self.assertEqual(record["attestation"], ATTESTATION)
+
+
+class AliasDataFileTests(StoreTestCase):
+    """The shipped `model-aliases.json` payload, exercised against a temp home."""
+
+    PAYLOAD = {
+        "terra": "openai:gpt-5.6-terra",
+        "gpt-5.6-terra": "openai:gpt-5.6-terra",
+        "gpt-5-6-terra": "openai:gpt-5.6-terra",
+        "flash": "google:gemini-3.6-flash-high",
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.home.mkdir(parents=True)
+        (self.home / "model-aliases.json").write_text(
+            json.dumps(self.PAYLOAD), encoding="utf-8"
+        )
+
+    def test_every_shipped_alias_resolves_to_its_binding(self):
+        aliases = load_aliases(self.home)
+        for spelling, binding in self.PAYLOAD.items():
+            with self.subTest(spelling=spelling):
+                self.assertEqual(normalize_model(spelling, aliases), binding)
+
+    def test_flash_resolves_to_the_served_high_binding(self):
+        self.assertEqual(
+            normalize_model("flash", load_aliases(self.home)), "google:gemini-3.6-flash-high"
+        )
+
+    def test_the_bare_flash_id_is_deliberately_absent_but_still_a_legal_binding(self):
+        # W-026: the bare id is not served (gateway README, verified 2026-07-26),
+        # so no alias points at it — but it is shape-valid, so a caller who
+        # passes it explicitly is not second-guessed by the writer.
+        self.assertNotIn("google:gemini-3.6-flash", self.PAYLOAD.values())
+        validate_record(
+            complete(intent(requested_model={"id": "google:gemini-3.6-flash", "raw": "flash"}))
+        )
+
+    def test_an_aliased_flash_spawn_writes_end_to_end(self):
+        record = write_record(
+            self.home, intent(surface="cli", requested_model={"id": "flash", "raw": "flash"})
+        )
+        self.assertEqual(record["requested_model"]["id"], "google:gemini-3.6-flash-high")
+        self.assertEqual(record["requested_model"]["raw"], "flash")
 
 
 if __name__ == "__main__":
