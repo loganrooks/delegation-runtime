@@ -67,10 +67,12 @@ error; `--allow-orphan` overrides, record flagged `orphan: true`), `outcome_ordi
 ≥0; auto-assigned as max+1 for that run_id if omitted), `terminal` (bool; **at most one
 terminal outcome per run_id — enforce**), `disposition` (enum: `accepted|
 accepted-after-rework|rejected|parked|interrupted|blocked|error|abandoned|
-completed-unknown`).
+completed-unknown`), `observed_model` (object: `id` normalized, `identity_source`:
+`transcript|api|ui-label`) — REQ per crosswalk §3 (this spec originally listed it
+optional; the build followed the crosswalk per the conflict rule, and the spec is
+corrected here).
 
-Optional: `observed_model` (object: `id` normalized, `identity_source`:
-`transcript|api|ui-label`), `observed_effort` (effort enum), `tokens` (object of ints:
+Optional: `observed_effort` (effort enum), `tokens` (object of ints:
 `in|out|cache_r|cache_w`, each nullable), `cost_usd` (number), `rework_actor`
 (`root|delegate|none|unknown`), `rework_count` (int), `validator` (object: `id` str,
 `outcome` registered-vocab-or-`other` + free slot rule as above), `friction_codes`/
