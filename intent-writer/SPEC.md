@@ -5,7 +5,14 @@ amended v0.2.1 2026-07-26 after this module's R1 conformance review, then v0.2.2
 Flash-pilot panel) —
 `delegation-triage:docs/proposals/2026-07-24-intent-outcome-record-crosswalk.md`. The seven
 v0.2.1 areas are marked **[v0.2.1]** below and the three additive v0.2.2 changes **[v0.2.2]**;
-both syncs followed their implementing commit in the same pass. This module
+both syncs followed their implementing commit in the same pass.
+
+Items marked **[SC]** come from the cross-vendor (gpt-5.6-sol) code review of `b1a8646`
+(adjudication: `delegation-triage:docs/reviews/2026-07-26-sol-design-wave1-adjudication.md`,
+10/10 accepted). **These are implementation hardening, not schema change** — the crosswalk
+stays at v0.2.2 and no field changed meaning. Several are the crosswalk's own rules finally
+being *enforced* (§1's "`run_id` unique within origin" was previously keyed globally). This
+module
 is the "one NEW writer" its §6.3 names: driver-side, `driver-attested`, carrying the four
 fields no existing capture source supplies (`route_id`, `warrant_ids`, `surface`,
 `harness_contract`). It writes NEW v2 records only — it is NOT a projector (projectors over
@@ -25,11 +32,35 @@ hooks, no background process.** Two operations:
   `--home` / `DELEGATION_V2_HOME`; default as stated). One record per line, sorted keys,
   compact separators.
 - **Never** append to any v1 store (crosswalk §6.0-b: a v2 line bricks S3's v1 readers).
-- Write pattern reimplementing S3's proven approach: lock file with bounded retry,
-  `O_APPEND|O_CREAT` 0o600, fsync, duplicate-`event_id` rejection. The sentinel carries
-  pid+nonce and is released only by its owner (a writer whose lock was stale-reclaimed must not
-  unlink the new holder's), and a short append is rolled back to the pre-write size inside the
-  lock so a partial line cannot wedge the store.
+- **Mutual exclusion is `fcntl.flock` on `<home>/.intents.lock` [SC-1].** The kernel owns the
+  lock, so it releases on close AND on process death. **No lease, no stale-lock reclaim, no
+  owner token** — the previous sentinel protocol (mtime lease + pid+nonce, itself the R1 F-8
+  fix) could not make reclaim atomic: two writers observing one stale sentinel could both
+  unlink and both claim, and the release-time `holds?`/`unlink` pair was its own TOCTOU. The
+  lock file is never unlinked; removing it would let a later writer lock a different inode
+  while a holder still has the old one.
+- Append with `O_APPEND|O_CREAT|O_NOFOLLOW` 0o600 + fsync. A short append is rolled back to the
+  pre-write size inside the lock, so a partial line cannot wedge the store.
+- **Filesystem posture [SC-8]:** the store is opened `O_NOFOLLOW`, confirmed a regular file by
+  `fstat` before any byte is read or written, and `fchmod`ed to 0600 on every append —
+  `0o600`-on-create alone leaves a pre-existing 0644 file permissive, and a planted symlink
+  would redirect the append outside the home. `O_NONBLOCK` is set on both opens and cleared
+  after the regular-file check: opening a planted FIFO otherwise *blocks the writer forever*
+  instead of rejecting it, since the check necessarily runs after the open.
+- **Trailing-newline preflight [SC-3]:** a non-empty store whose last line lacks `\n` is
+  refused on read and before any append, rather than having the next record glued onto it as
+  `}{`. Checked under the lock, before a byte is written.
+- **One scan per write [SC-6].** The lock is taken, the store is parsed ONCE into an index
+  carrying every invariant the write needs (duplicate ids, both ordinal sequences, identity
+  uniqueness), then the record is appended. Formerly three separate whole-store scans. This is
+  still O(store) per write — O(N²) to build N records — which is accepted at current volumes
+  and stated rather than hidden; a durable index is deferred, and the trigger to build one is
+  write latency becoming noticeable, not a record count.
+- **`fsync` failure after a complete write is an `UNKNOWN COMMIT` [SC-10]:** the bytes are in
+  the file but may not be durable and the writer cannot tell. The error carries the
+  `event_id` and the CLI exits **3** — deliberately distinct from the ordinary failure code 1,
+  so a wrapper that retries failures does not blindly mint a second record for one delegation.
+  A retry must reuse the returned `event_id`.
 
 ## Record shapes (from crosswalk v0.2.1 §§1–4 — the spec of record; on any conflict, the
 crosswalk wins and this file has a bug)
@@ -40,14 +71,30 @@ crosswalk wins and this file has a bug)
 |---|---|---|
 | `v` | ✓ | literal `"2"` |
 | `kind` | ✓ | `intent` \| `outcome` \| `rekey` (rekey: accept and validate the shape from crosswalk §1; no CLI needed yet) |
-| `event_id` | ✓ | ULID (Crockford base32, 26 chars, time-prefixed — implement in-module, stdlib only) |
+| `event_id` | ✓ | ULID (Crockford base32, 26 chars, time-prefixed — implement in-module, stdlib only). **Overflow forms rejected [SC-7]:** 26 Crockford chars carry 130 bits and a ULID is 128, so the first character must be `0`–`7`; `"Z"*26` decodes to a time prefix past the 48-bit maximum |
 | `ts` | ✓ | ISO-8601 UTC with `Z` |
-| `origin` | | omitted ⇒ implied `local` |
-| `run_id` | ✓ | caller-supplied; unique within origin; local records keep native value |
-| `session_id` | | opaque |
-| `spawn_ordinal` | ✓ intent | int; per-session counter derived by scanning **the whole store** for that `session_id` **[v0.2.1]** — a month-file-only scan restarts the count at a month boundary and collides with the session's own earlier spawns (correctness over speed at current volumes) |
+| `origin` | | omitted ⇒ implied `local`. **[SC-4]** That implication is applied when KEYING (see below), never by stamping the record — §1 says local records may omit it, so it stays omitted on disk |
+| `run_id` | ✓ | caller-supplied; **unique within origin** — so every join and invariant is keyed `(origin, run_id)` **[SC-4]**, never `run_id` alone. Two origins may each carry a run named `r`, each with its own ordinals and its own terminal outcome. Local records keep the native value |
+| `session_id` | | opaque. **Absent `session_id` is a real bucket, not a missing one [SC-5]:** unsessioned intents share one per-origin bucket keyed `None`, counted and uniqueness-checked exactly like a named session, and distinct from every named session |
+| `spawn_ordinal` | ✓ intent | int; per-session counter derived by scanning **the whole store** for that `(origin, session_id)` **[v0.2.1][SC-4]** — a month-file-only scan restarts the count at a month boundary and collides with the session's own earlier spawns (correctness over speed at current volumes) |
 | `attestation` | ✓ | literal `driver-attested` (this writer's tier); reject others |
 | `projection` | ✓ | literal `native` (this writer never projects); reject others |
+
+**Record identity — enforced at write AND at validate [SC-5]:**
+
+- **One intent per `(origin, run_id)`.** A second is either a re-spawn needing its own `run_id`
+  or a double-write; both are refused rather than silently fanning out the §3 join.
+- **One intent per `(origin, session_id, spawn_ordinal)`**, including the unsessioned `None`
+  bucket. An explicitly-supplied ordinal is collision-checked, not trusted.
+- **One outcome per `(origin, run_id, outcome_ordinal)`**, and one `terminal: true` per
+  `(origin, run_id)`.
+
+**`event_id` ordering [SC-7]:** the generator is monotonic **within a process** —
+same-millisecond calls increment the entropy instead of re-randomizing, a backwards wall clock
+is clamped to the last issued millisecond, and entropy exhaustion rolls into the next
+millisecond. **This does not extend across processes:** two concurrent writers can issue
+same-millisecond ids that sort arbitrarily against each other. Consumers order by `ts` and
+append position; `event_id` is an identifier, not the sort key.
 
 ### Intent (`kind: intent`)
 
@@ -129,6 +176,17 @@ the record SET a consumer reads across writers.
 ## Validation — fail closed (crosswalk §5)
 
 - Allowlist over field NAMES per kind; unknown fields ⇒ reject (S3's mechanism).
+- **Numerics must be finite [SC-2].** `NaN`/`Infinity` serialize as bare `NaN`/`Infinity`,
+  which is not JSON — one such line makes a strict reader reject the entire store. `NaN` also
+  defeats every range check silently, since all comparisons against it are false. Enforced with
+  `math.isfinite` per value plus `json.dumps(..., allow_nan=False)` at the serializer.
+- **Dates are checked semantically, not just by shape [SC-9].** `2026-99-99` matches the
+  regex; `date.fromisoformat` is what rejects it.
+- **Display-bearing text rejects lone surrogates and bidi format controls [SC-9].** A lone
+  surrogate survives `json.dumps` (escaped) but is not encodable UTF-8, so it breaks strict
+  consumers; a bidi override (U+202E and relatives) makes a label render as something other
+  than what was recorded. Applies to labels, `raw` spellings, `class_free`, and every `*_free`
+  slot. Ordinary non-ASCII text is unaffected.
 - Value rules per the tables above — enum membership checked, not just shape. This is the
   name-AND-value discipline the crosswalk added over S3.
 - `CODE_RE = ^[A-Za-z0-9][A-Za-z0-9._:+/@-]{0,127}$` for code-shaped strings. **CODE_RE alone
@@ -182,6 +240,16 @@ surface, route_id — read-only.
   registered member still rejected; unregistered codes still rejected; the severe-failure
   classes rejected as `confounder_codes` (the friction-only reading, asserted so it fails first
   if widened); and the shipped alias payload resolving against a temp home — never the real one.
+- **[SC]** Plus the review's 12-item test-gap list: simultaneous lock contenders and
+  release-by-process-death; a lock held longer than any former lease; non-finite floats plus a
+  strict-JSON round-trip of the written store; a store whose final line lacks `\n`, on both
+  read and write; cross-origin joins, ordinals and terminals; duplicate `(origin, run_id)` and
+  duplicate session ordinals, at write and at validate; ordinal derivation with no
+  `session_id`; same-ms ULID bursts, clock regression, entropy rollover, overflow first
+  character, and id/`ts` consistency; one-scan-per-write and a few-hundred-record run;
+  pre-existing permissive modes, symlinks and FIFOs in the store position; semantic dates,
+  lone surrogates, bidi controls, and strict UTF-8 round-trip; and `fsync` failure after a
+  complete write surfacing the id and exit code 3.
 - Target: the existing suites stay green; new suite ≥25 tests.
 
 ## Non-goals
