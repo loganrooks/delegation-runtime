@@ -3,10 +3,11 @@
 Cross-runtime delegation machinery: programs a host harness (currently Codex) runs to spawn,
 govern, and reconcile delegated worker sessions on other providers' agents — today
 delegate-to-claude (Claude sessions) and delegate-to-antigravity (Gemini Flash via the
-Antigravity bridge), sharing a `delegation_policy` schema/diff/explain core.
+Antigravity bridge), sharing a `delegation_policy` schema/diff/explain core. `intent-writer/`
+is the driver-side v2 record writer (B-7) that emits the routing evidence those runs produce.
 
-**Status: pre-validation.** 307 passing tests (223 claude + 10 antigravity + 74 policy),
-**zero completed real worker turns**. The first milestone is one attested end-to-end worker
+**Status: pre-validation.** 395 passing tests (223 claude + 10 antigravity + 74 policy +
+88 intent-writer), **zero completed real worker turns**. The first milestone is one attested end-to-end worker
 turn (registered in delegation-triage's 2026-07-24 portfolio review as item C-3, parked
 pending operator-authorized spend). Until then, nothing here is a validated route.
 
@@ -46,9 +47,11 @@ PYTHONPATH=delegate-to-antigravity/scripts:scripts \
   python3 -m unittest discover -s delegate-to-antigravity/tests -p 'test_*.py'
 PYTHONPATH=scripts \
   python3 -m unittest discover -s tests -p 'test_*.py'
+PYTHONPATH=intent-writer/scripts:scripts \
+  python3 -m unittest discover -s intent-writer/tests -p 'test_*.py'
 ```
 
-CI (`.github/workflows/ci.yml`) runs all three; the delegate-to-claude step is the one that
+CI (`.github/workflows/ci.yml`) runs all four; the delegate-to-claude step is the one that
 formerly sat, uncommitted, in delegation-triage's `ci.yml` (its D-6 coupling — resolved
 "neither" by this move).
 

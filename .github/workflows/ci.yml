@@ -21,3 +21,6 @@ jobs:
       - name: delegation_policy tests
         run: |
           PYTHONPATH=scripts python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: intent-writer tests
+        run: |
+          PYTHONPATH=intent-writer/scripts:scripts python3 -m unittest discover -s intent-writer/tests -p 'test_*.py' -v
