@@ -5,12 +5,30 @@ description: Use when Codex should delegate a bounded review, investigation, or 
 
 # Delegate to Antigravity
 
+**Status: caller scope widened 2026-07-27 by operator ratification — Claude Code sessions may
+invoke this adapter in addition to Codex, for the duration of the Flash placement pilot
+(delegation-triage `docs/proposals/2026-07-26-gemini-flash-36-pilot.md`). The invoking driver,
+whichever harness it runs in, retains routing, integration, and verification, and writes v2
+intent/outcome records per spawn (intent-writer, B-7).**
+
 Use the temporary adapter as an explicit worker surface. Codex retains routing, integration, and
 verification. This MVP is manual and intentionally smaller than the deferred provider-neutral
 router.
 
 **Required:** use `delegation-triage` first. Define the objective, non-goals, owned files, allowed
 effects, validation, return shape, and escalation conditions. Give one writer a checkout.
+
+**Required per spawn — v2 intent/outcome records (intent-writer, B-7):** write an intent
+BEFORE the spawn and ≥1 terminal outcome after, via
+`intent-writer/scripts/intent_writer.py` (`write_record` or `--json`; store
+`~/.delegation/v2/`). Templates: delegation-triage `probes/fixtures/flash-pilot/`
+(`intent.template.json` / `outcome.template.json` + README rules-that-bite). For pilot
+legs: `run_id` = probe_id; `harness_contract` cites the lane manifest
+(`fp0d-loopback-manifest-v1` / `fpc-native-manifest-v1` — re-hash at spawn time);
+`router_model`/`router_effort` READ from the driver transcript or `$CLAUDE_EFFORT`, never
+assumed; empty/non-delivering leg → `disposition: error`, never `accepted`. Records are
+conformant by default when authored from the templates — hand-authoring from memory is the
+highest-probability quiet-non-compliance point (pilot §5 F-7).
 
 ## Workflow
 
